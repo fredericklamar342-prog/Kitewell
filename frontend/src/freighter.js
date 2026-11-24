@@ -2,6 +2,7 @@ import {
   isConnected,
   setAllowed,
   getAddress,
+  getNetworkDetails,
   getNetwork,
   signTransaction,
   signAuthEntry,
@@ -15,7 +16,9 @@ import {
   MAX_ASSET_CODE_LENGTH,
 } from "./stellar";
 import { parseHorizonError } from "./horizonErrorParse";
+import { formatTrustlineLimit } from "./trustlineLimitFormat";
 import { parseSimulationFees } from "./simulationFees";
+import { getFeePerOperation } from "./feeSetting";
 import {
   HORIZON_FAILURE_CODE,
   freighterCancelledError,
@@ -37,78 +40,142 @@ function currentPassphrase() {
   return getActiveNetwork().passphrase;
 }
 
+/** Selected fee per operation; falls back to the SDK default (100 stroops). */
+function selectedFeePerOperation() {
+  return getFeePerOperation() ?? StellarSdk.BASE_FEE;
+}
+
 const MAX_MEMO_TEXT_BYTES = 28;
 const MAX_U64 = 18446744073709551615n;
+export const TRANSACTION_FEE_STROOPS = StellarSdk.BASE_FEE;
 
-/** Public Stellar RPC endpoint for Soroban reads + invokes (Testnet). */
-export const SOROBAN_RPC_URL = "https://soroban-testnet.stellar.org";
-const sorobanRpc = new StellarSdk.rpc.Server(SOROBAN_RPC_URL);
-
-/** Read-only invokes need a funded-looking source; the zero address works. */
-const ZERO_ADDRESS =
-  "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-
-const POLL_ATTEMPTS = 15;
-const POLL_INTERVAL_MS = 2000;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function scOptionToNative(scVal) {
-  if (!scVal) return null;
-  const native = StellarSdk.scValToNative(scVal);
-  // Option<T> arrives as an empty vec (None) or a one-element vec (Some).
-  return Array.isArray(native) ? (native.length > 0 ? native[0] : null) : native;
-}
-
-function buildContractTx(contract, method, args, sourceAccount, timeout = 60) {
-  return new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+/** Build a spec-driven client for the active network's contract calls. */
+function kitewellClient(contractId) {
+  return createKitewellClient({
+    contractId,
     networkPassphrase: currentPassphrase(),
-  })
-    .addOperation(contract.call(method, ...args))
-    .setTimeout(timeout)
-    .build();
+  });
+}
+
+/** Send prepared XDR to Freighter and return the signed transaction. */
+function freighterSigner(publicKey) {
+  return (unsignedXdr) => signWithFreighter(unsignedXdr, publicKey);
+}
+
+const WASM_MAGIC = [0x00, 0x61, 0x73, 0x6d]; // \0asm
+
+/** Accept a File.arrayBuffer(), Uint8Array, or byte array, with a magic check. */
+function normalizeWasmBytes(wasmBytes) {
+  let bytes;
+  if (wasmBytes instanceof Uint8Array) {
+    bytes = wasmBytes;
+  } else if (wasmBytes instanceof ArrayBuffer) {
+    bytes = new Uint8Array(wasmBytes);
+  } else if (Array.isArray(wasmBytes)) {
+    bytes = Uint8Array.from(wasmBytes);
+  } else {
+    throw new Error("Choose the built kitewell.wasm file to deploy.");
+  }
+
+  if (bytes.length < 8 || !WASM_MAGIC.every((byte, i) => bytes[i] === byte)) {
+    throw new Error("Not a Wasm binary — choose the built kitewell.wasm file.");
+  }
+  return bytes;
+}
+
+function newSalt() {
+  const salt = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(salt);
+  return salt;
+}
+
+function assertPublicKey(publicKey) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
 }
 
 /**
- * Read-only lookups against the Kitewell registry via Soroban RPC.
- * Calls lab_name(), builder_count(), and get_builder(viewer).
- *
- * @returns {{ labName: string, builderCount: number, builder: string|null }}
+ * A create-contract tx has one host-function op; its result carries the new
+ * contract ID as a 32-byte hash.
  */
-export async function readKitewellState(contractId, viewerAddress) {
-  if (!StellarSdk.StrKey.isValidContract(contractId)) {
+function contractIdFromResult(resultXdr) {
+  try {
+    const result =
+      typeof resultXdr === "string"
+        ? StellarSdk.xdr.TransactionResult.fromXDR(resultXdr, "base64")
+        : resultXdr;
+    const createResult = result
+      ?.result?.()
+      ?.results?.()[0]
+      ?.tr?.()
+      ?.invokeHostFunctionResult?.();
+    if (!createResult || createResult.switch().value !== 0) return null;
+    return StellarSdk.Address.contract(createResult.success()).toString();
+  } catch {
+    return null;
+  }
+}
+
+/** Prepare, sign with Freighter, submit, and poll until the tx is applied. */
+async function prepareSignSubmit(transaction, publicKey, label) {
+  const prepared = await sorobanRpc.prepareTransaction(transaction);
+  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
+  const sendResult = await sorobanRpc.sendTransaction(signedTx);
+
+  if (sendResult.status === "ERROR") {
     throw new Error(
-      "Contract ID must be a valid Soroban contract strkey (C…)."
+      `${label} rejected by the network. Tx hash: ${sendResult.hash}`
     );
   }
 
-  const contract = new StellarSdk.Contract(contractId);
-  const viewer = viewerAddress || ZERO_ADDRESS;
-  const source = new StellarSdk.Account(ZERO_ADDRESS, "0");
-
-  const simulate = async (method, ...args) => {
-    const tx = buildContractTx(contract, method, args, source, 30);
-    const sim = await sorobanRpc.simulateTransaction(tx);
-    if (sim.error) {
-      throw new Error(`${method}() simulation failed: ${sim.error}`);
+  // RPC submission is asynchronous: poll getTransaction until applied.
+  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
+    const status = await sorobanRpc.getTransaction(sendResult.hash);
+    if (status.status === "SUCCESS") {
+      return { hash: sendResult.hash, returnValue: status.returnValue ?? null, status };
     }
-    return sim.result?.retval ?? null;
-  };
+    if (status.status === "FAILED") {
+      throw new Error(`${label} failed on-chain. Tx hash: ${sendResult.hash}`);
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
 
-  const [labName, builderCount, builder] = await Promise.all([
-    simulate("lab_name").then((v) => (v ? StellarSdk.scValToNative(v) : null)),
-    simulate("builder_count").then((v) =>
-      v ? StellarSdk.scValToNative(v) : 0
-    ),
-    simulate("get_builder", StellarSdk.nativeToScVal(viewer, { type: "address" })).then(
-      scOptionToNative
-    ),
-  ]);
+  // Still pending after the polling window; the tx may land shortly.
+  return { hash: sendResult.hash, returnValue: null, status: null };
+}
 
-  return { labName, builderCount, builder };
+/**
+ * Refuse to sign a contract invoke when Freighter is pointed at a different
+ * network than the contract the backend reports. Previously this surfaced as
+ * an opaque signing or submission failure after the wallet had already been
+ * prompted.
+ */
+async function assertFreighterNetwork(expectedPassphrase) {
+  const details = await getNetworkDetails();
+  if (details.error) {
+    throw new Error(
+      details.error.message || "Could not read the network from Freighter."
+    );
+  }
+  if (details.networkPassphrase !== expectedPassphrase) {
+    throw new Error(
+      `Freighter is on ${details.network}, but this contract is on a different network. ` +
+        "Switch Freighter to the Lab network and try again."
+    );
+  }
+}
+
+/**
+ * Read-only lookups against the Kitewell registry through the generated
+ * client: lab_name(), builder_count(), get_builder(viewer), paused(), and
+ * get_admin().
+ *
+ * @returns {{ labName: string, builderCount: number, builder: string|null,
+ *   paused: boolean, admin: string|null }}
+ */
+export async function readKitewellState(contractId, viewerAddress) {
+  return kitewellClient(contractId).readState(viewerAddress);
 }
 
 /**
@@ -176,7 +243,8 @@ export async function simulateRegisterBuilder(publicKey, contractId, name) {
 export async function registerBuilderWithFreighter(
   publicKey,
   contractId,
-  name
+  name,
+  expectedPassphrase = currentPassphrase()
 ) {
   const trimmed = (name || "").trim();
   if (!trimmed) {
@@ -188,57 +256,56 @@ export async function registerBuilderWithFreighter(
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
     throw new Error("Connect a valid Freighter address first.");
   }
-  if (!StellarSdk.StrKey.isValidContract(contractId)) {
-    throw new Error(
-      "Contract ID must be a valid Soroban contract strkey (C…)."
-    );
-  }
 
-  const contract = new StellarSdk.Contract(contractId);
-  const sourceAccount = await sorobanRpc.getAccount(publicKey);
-  const transaction = buildContractTx(
-    contract,
-    "register",
-    [
-      StellarSdk.nativeToScVal(publicKey, { type: "address" }),
-      StellarSdk.nativeToScVal(trimmed, { type: "string" }),
-    ],
-    sourceAccount
+  await assertFreighterNetwork(expectedPassphrase);
+
+  return kitewellClient(contractId).register(
+    publicKey,
+    trimmed,
+    freighterSigner(publicKey)
   );
+}
 
-  // Simulation fills in auth entries + resource fees for the invoke.
-  const prepared = await sorobanRpc.prepareTransaction(transaction);
-  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
-  const sendResult = await sorobanRpc.sendTransaction(signedTx);
-
-  if (sendResult.status === "ERROR") {
-    throw new Error(
-      `Contract invoke rejected by the network. Tx hash: ${sendResult.hash}`
-    );
+/**
+ * Pause or unpause registration. Only the contract admin's signature is
+ * accepted; anyone else gets the contract's NotAdmin error in plain language
+ * and the flag is left untouched.
+ */
+export async function setPausedWithFreighter(
+  publicKey,
+  contractId,
+  paused,
+  expectedPassphrase = currentPassphrase()
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
   }
 
-  // RPC submission is asynchronous: poll getTransaction until applied.
-  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
-    const status = await sorobanRpc.getTransaction(sendResult.hash);
-    if (status.status === "SUCCESS") {
-      return {
-        hash: sendResult.hash,
-        returnValue: status.returnValue
-          ? StellarSdk.scValToNative(status.returnValue)
-          : null,
-        confirmed: true,
-      };
-    }
-    if (status.status === "FAILED") {
-      throw new Error(
-        `Contract invoke failed on-chain. Tx hash: ${sendResult.hash}`
-      );
-    }
-    await sleep(POLL_INTERVAL_MS);
+  await assertFreighterNetwork(expectedPassphrase);
+
+  return kitewellClient(contractId).setPaused(
+    publicKey,
+    Boolean(paused),
+    freighterSigner(publicKey)
+  );
+}
+
+/** Remove the connected builder's own check-in with their signature. */
+export async function unregisterBuilderWithFreighter(
+  publicKey,
+  contractId,
+  expectedPassphrase = currentPassphrase()
+) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
   }
 
-  // Still pending after the polling window; the tx may land shortly.
-  return { hash: sendResult.hash, returnValue: null, confirmed: false };
+  await assertFreighterNetwork(expectedPassphrase);
+
+  return kitewellClient(contractId).unregister(
+    publicKey,
+    freighterSigner(publicKey)
+  );
 }
 
 function createMemo(memoType, value) {
@@ -376,22 +443,24 @@ async function signWithFreighter(unsignedXdr, publicKey) {
   );
 }
 
-async function signAndSubmit(transaction, publicKey) {
-  const signedTx = await signWithFreighter(transaction.toXDR(), publicKey);
+async function submitSignedTransaction(signedTx) {
   try {
     return await getServer().submitTransaction(signedTx);
   } catch (error) {
-    const body = error?.response?.data;
-    if (body && typeof body === "object") {
-      try {
-        const { reason } = parseHorizonError(body);
-        throw horizonFailureError(reason, error);
-      } catch (maybeWrapped) {
-        if (maybeWrapped?.code === HORIZON_FAILURE_CODE) throw maybeWrapped;
-      }
-    }
-    throw error;
+    const transactionFailure = getTransactionFailure(error);
+    if (!transactionFailure) throw error;
+
+    const failureError = horizonFailureError(
+      "Transaction failed on the network."
+    );
+    failureError.transactionFailure = transactionFailure;
+    throw failureError;
   }
+}
+
+async function signAndSubmit(transaction, publicKey) {
+  const signedTx = await signWithFreighter(transaction.toXDR(), publicKey);
+  return submitSignedTransaction(signedTx);
 }
 
 /**
@@ -458,7 +527,7 @@ export async function buildUnsignedEnvelope(
   // Load the account immediately before building so a stale sequence is refused.
   const sourceAccount = await getServer().loadAccount(publicKey);
   const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   });
 
@@ -516,13 +585,15 @@ export async function submitEnvelopeWithFreighter(unsignedXdr, publicKey) {
   }
 
   const signedTx = await signWithFreighter(unsignedXdr, publicKey);
-  return getServer().submitTransaction(signedTx);
+  return submitSignedTransaction(signedTx);
 }
 
 /**
  * Build a payment op, sign it with Freighter, and submit it to Horizon.
  * `asset` accepts a UI descriptor (`{ isNative: true }` or
  * `{ isNative: false, code, issuer }`); omit it to send native XLM.
+ * Optional `minTime` and `maxTime` are Unix timestamps (seconds) for transaction time bounds.
+ * When both are provided, they replace the default timeout.
  */
 export async function sendPaymentWithFreighter(
   publicKey,
@@ -530,17 +601,62 @@ export async function sendPaymentWithFreighter(
   amount,
   asset = null,
   memoType = "text",
-  memo = ""
+  memo = "",
+  minTime = null,
+  maxTime = null
 ) {
-  const unsignedXdr = await buildPaymentEnvelope(
-    publicKey,
-    destination,
-    amount,
-    asset,
-    memoType,
-    memo
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
+    if (typeof destination !== "string" || !destination.includes("*")) {
+      throw new Error("Destination must be a valid Stellar public key (G…).");
+    }
+  }
+
+  const resolvedDestination = await resolveFederationAddress(destination);
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(resolvedDestination)) {
+    throw new Error("Destination must be a valid Stellar public key (G…).");
+  }
+
+  // Validate time bounds if provided
+  if (minTime !== null || maxTime !== null) {
+    const min = minTime !== null ? Number(minTime) : 0;
+    const max = maxTime !== null ? Number(maxTime) : 0;
+    const now = Math.floor(Date.now() / 1000);
+
+    if (minTime !== null && maxTime !== null && max <= min) {
+      throw new Error("Maximum time must be after minimum time.");
+    }
+    if (maxTime !== null && max <= now) {
+      throw new Error("Maximum time must be in the future.");
+    }
+  }
+
+  const transactionMemo = createMemo(memoType, memo);
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: currentPassphrase(),
+  }).addOperation(
+    StellarSdk.Operation.payment({
+      destination: resolvedDestination,
+      asset: resolvePaymentAsset(asset),
+      amount: amount.toString(),
+    })
   );
-  return submitEnvelopeWithFreighter(unsignedXdr, publicKey);
+
+  if (transactionMemo) {
+    txBuilder.addMemo(transactionMemo);
+  }
+
+  let transaction;
+  if (minTime !== null || maxTime !== null) {
+    const min = minTime !== null ? Number(minTime) : 0;
+    const max = maxTime !== null ? Number(maxTime) : 0;
+    transaction = txBuilder.setTimebounds(min, max).build();
+  } else {
+    transaction = txBuilder.setTimeout(180).build();
+  }
+
+  return signAndSubmit(transaction, publicKey);
 }
 
 /**
@@ -591,7 +707,7 @@ export async function pathPaymentWithFreighter({
     ? StellarSdk.Operation.pathPaymentStrictReceive({
         sendAsset: sourceAsset,
         sendMax: boundValue,
-        destination,
+        destination: resolvedDestination,
         destAsset: destinationAsset,
         destAmount: amountValue,
         path: intermediatePath,
@@ -599,7 +715,7 @@ export async function pathPaymentWithFreighter({
     : StellarSdk.Operation.pathPaymentStrictSend({
         sendAsset: sourceAsset,
         sendAmount: amountValue,
-        destination,
+        destination: resolvedDestination,
         destAsset: destinationAsset,
         destMin: boundValue,
         path: intermediatePath,
@@ -608,7 +724,7 @@ export async function pathPaymentWithFreighter({
   // Load the account immediately before building so a stale sequence is refused.
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(operation)
@@ -686,8 +802,44 @@ export async function changeTrustWithFreighter(
   const asset = new StellarSdk.Asset(assetCode.toUpperCase(), assetIssuer);
   // Load the account immediately before building so a stale sequence is refused.
   const sourceAccount = await getServer().loadAccount(publicKey);
+  if (limit !== "0") {
+    const baseReserve = await getLatestBaseReserve();
+    const subentryCount = Number(sourceAccount.subentry_count);
+    const nativeBalance = sourceAccount.balances?.find(
+      (balance) => balance.asset_type === "native"
+    )?.balance;
+    if (!Number.isInteger(subentryCount) || nativeBalance == null) {
+      throw new Error(
+        "Could not verify the account balance and subentries; trustline signing is disabled."
+      );
+    }
+
+    const hasTrustline = sourceAccount.balances.some(
+      (balance) =>
+        balance.asset_issuer === assetIssuer &&
+        balance.asset_code === assetCode.toUpperCase()
+    );
+    const minimum = minimumBalanceInStroops(
+      baseReserve,
+      subentryCount + (hasTrustline ? 0 : 1)
+    );
+    if (
+      !remainsAboveMinimum(
+        nativeBalance,
+        "0",
+        StellarSdk.BASE_FEE,
+        minimum
+      )
+    ) {
+      const required = formatStroops(minimum + BigInt(StellarSdk.BASE_FEE));
+      throw new Error(
+        `Insufficient XLM for this trustline: the account needs ${required} XLM for its reserve and fee.`
+      );
+    }
+  }
+
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(
@@ -702,526 +854,191 @@ export async function changeTrustWithFreighter(
   return signAndSubmit(transaction, publicKey);
 }
 
-function claimableBalanceId(balanceId) {
-  const id = String(balanceId || "").toLowerCase();
-  if (/^[0-9a-f]{72}$/.test(id)) {
-    if (!id.startsWith("00000000")) {
-      throw new Error("Claimable balance ID is not a claimable-balance type.");
-    }
-    return id;
-  }
-  if (/^[0-9a-f]{64}$/.test(id)) {
-    return `00000000${id}`;
-  }
-  throw new Error("Claimable balance ID must be 64 or 72 hexadecimal characters.");
-}
-
 /**
- * Update an issuer's home domain and/or auth flags with `setOptions`, signed by
- * the connected account. Validation (including the immutable confirmation
- * gate) lives in `buildSetOptionsBody`, so an unsafe combination never reaches
- * Freighter.
- */
-
-
-/** Claw back an unclaimed balance for an issued asset. */
-export async function clawbackClaimableBalanceWithFreighter(publicKey, balanceId) {
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
-    throw new Error("Connect a valid Freighter address first.");
-  }
-  const encodedBalanceId = claimableBalanceId(balanceId);
-
-  const sourceAccount = await getServer().loadAccount(publicKey);
-  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
-    networkPassphrase: currentPassphrase(),
-  })
-    .addOperation(
-      StellarSdk.Operation.clawbackClaimableBalance({
-        balanceId: encodedBalanceId,
-      })
-    )
-    .setTimeout(180)
-    .build();
-
-  return signAndSubmit(transaction, publicKey);
-}
-
-export async function setAccountOptionsWithFreighter(publicKey, options = {}) {
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
-    throw new Error("Connect a valid Freighter address first.");
-  }
-
-  const body = buildSetOptionsBody(options);
-  // Load the account immediately before building so a stale sequence is refused.
-  const sourceAccount = await getServer().loadAccount(publicKey);
-  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
-    networkPassphrase: currentPassphrase(),
-  })
-    .addOperation(StellarSdk.Operation.setOptions(body))
-    .setTimeout(180)
-    .build();
-
-  return signAndSubmit(transaction, publicKey);
-}
-
-/**
- * Authorize or revoke one holder's trustline with `allowTrust`.
+ * Resolve a federation address (e.g. "alice*stellar.org") into a Stellar
+ * public key, using the configured resolver.
  *
- * The asset issuer is the source account of an allowTrust op, so the connected
- * account must match `assetIssuer`; otherwise we would be trying to control an
- * asset somebody else issued.
+ * @returns {string|null} Valid Stellar public key (G…) or null if unresolved.
  */
-export async function allowTrustWithFreighter(
-  publicKey,
-  { holder, assetCode, assetIssuer, authorize } = {}
-) {
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
-    throw new Error("Connect a valid Freighter address first.");
+export async function resolveAddress(federationId) {
+  if (!federationId) return null;
+  const [name, domain] = federationId.split("*", 2);
+  if (!name || !domain) return null;
+
+  // Resolve via Soroban RPC, falling back to the legacy Horizon endpoint.
+  try {
+    const result = await sorobanRpc.resolveFederation(name, domain);
+    if (result && result.address) return result.address;
+  } catch (err) {
+    console.warn("Soroban federation resolution failed:", err);
   }
-  if (assetIssuer !== publicKey) {
-    throw new Error("Only the issuer can authorize or revoke this asset.");
-  }
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(holder)) {
-    throw new Error("Holder must be a valid Stellar public key (G…).");
-  }
-
-  const code = (assetCode || "").trim().toUpperCase();
-  if (!code || code.length > MAX_ASSET_CODE_LENGTH) {
-    throw new Error(`Asset code must be 1–${MAX_ASSET_CODE_LENGTH} characters.`);
-  }
-
-  // Load the account immediately before building so a stale sequence is refused.
-  const sourceAccount = await getServer().loadAccount(publicKey);
-  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
-    networkPassphrase: currentPassphrase(),
-  })
-    .addOperation(
-      StellarSdk.Operation.allowTrust({
-        trustor: holder,
-        assetCode: code,
-        authorize: Boolean(authorize),
-      })
-    )
-    .setTimeout(180)
-    .build();
-
-  // Deliberately do not pre-check the holder's balance: if a revoke is invalid
-  // (e.g. the trustline still holds a balance), Horizon's error is surfaced.
-  return signAndSubmit(transaction, publicKey);
-}
-
-/**
- * Read the configured contract instance's TTL from Soroban RPC.
- *
- * @returns {{ latestLedger: number, liveUntilLedgerSeq: number|null,
- *   ledgersRemaining: number }}
- */
-export async function readContractInstanceTtl(contractId) {
-  if (!StellarSdk.StrKey.isValidContract(contractId)) {
-    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
-  }
-
-  const contract = new StellarSdk.Contract(contractId);
-  const response = await sorobanRpc.getLedgerEntries(contract.getFootprint());
-  const latestLedger = response.latestLedger ?? 0;
-  const liveUntilLedgerSeq = response.entries?.[0]?.liveUntilLedgerSeq ?? null;
-
-  return {
-    latestLedger,
-    liveUntilLedgerSeq,
-    ledgersRemaining: liveUntilLedgerSeq
-      ? Math.max(0, liveUntilLedgerSeq - latestLedger)
-      : 0,
-  };
-}
-
-/**
- * Submit an `extendFootprintTtl` operation for the contract instance. This
- * never invokes register / pause / unregister — it only lengthens the
- * instance's ledger lifetime.
- *
- * `extendFootprintTtl` takes a ledger *count* from the current ledger, not an
- * absolute sequence number, so the absolute target is converted with the
- * latest ledger before building the op.
- *
- * `options.currentDeadline` / `options.latestLedger` let callers reuse the TTL
- * they already read; anything missing is read from Soroban RPC so the local
- * guards always hold.
- */
-export async function extendContractTtlWithFreighter(
-  publicKey,
-  contractId,
-  extendTo,
-  options = {}
-) {
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
-    throw new Error("Connect a valid Freighter address first.");
-  }
-  if (!StellarSdk.StrKey.isValidContract(contractId)) {
-    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
-  }
-
-  const target = Number(extendTo);
-  if (!Number.isSafeInteger(target) || target <= 0) {
-    throw new Error("Extend to a valid positive ledger number.");
-  }
-
-  let ttlInfo = null;
-  const currentDeadline =
-    options.currentDeadline ??
-    (ttlInfo = await readContractInstanceTtl(contractId)).liveUntilLedgerSeq ??
-    0;
-  if (target <= currentDeadline) {
-    throw new Error(
-      `New deadline must be later than the current one (${currentDeadline}).`
-    );
-  }
-
-  let latestLedger = options.latestLedger;
-  if (latestLedger === undefined || latestLedger === null) {
-    if (!ttlInfo) ttlInfo = await readContractInstanceTtl(contractId);
-    latestLedger = ttlInfo.latestLedger;
-  }
-
-  const extendBy = target - latestLedger;
-  if (!Number.isSafeInteger(extendBy) || extendBy <= 0) {
-    throw new Error(
-      `New deadline must be later than the latest ledger (${latestLedger}).`
-    );
-  }
-
-  const contract = new StellarSdk.Contract(contractId);
-  const sourceAccount = await sorobanRpc.getAccount(publicKey);
-  const sorobanData = new StellarSdk.SorobanDataBuilder()
-    .setFootprint([contract.getFootprint()], [])
-    .setResourceFee("100")
-    .build();
-
-  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
-    networkPassphrase: currentPassphrase(),
-    sorobanData,
-  })
-    .addOperation(
-      StellarSdk.Operation.extendFootprintTtl({ extendTo: extendBy })
-    )
-    .setTimeout(180)
-    .build();
-
-  const prepared = await sorobanRpc.prepareTransaction(transaction);
-  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
-  const sendResult = await sorobanRpc.sendTransaction(signedTx);
-
-  if (sendResult.status === "ERROR") {
-    throw new Error(
-      `TTL extension rejected by the network. Tx hash: ${sendResult.hash}`
-    );
-  }
-
-  for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
-    const status = await sorobanRpc.getTransaction(sendResult.hash);
-    if (status.status === "SUCCESS") {
-      return {
-        hash: sendResult.hash,
-        liveUntilLedgerSeq: target,
-        confirmed: true,
-      };
-    }
-    if (status.status === "FAILED") {
-      throw new Error(
-        `TTL extension failed on-chain. Tx hash: ${sendResult.hash}`
-      );
-    }
-    await sleep(POLL_INTERVAL_MS);
-  }
-
-  return {
-    hash: sendResult.hash,
-    liveUntilLedgerSeq: target,
-    confirmed: false,
-  };
-}
-
-/** Accept either a real RPC ScVal or an already-native fixture value. */
-function nativeOrValue(value) {
-  if (value && typeof value === "object" && typeof value.switch === "function") {
-    try {
-      return StellarSdk.scValToNative(value);
-    } catch {
-      return value;
-    }
-  }
-  return value;
-}
-
-function eventContractId(event) {
-  const id = event?.contractId;
-  if (!id) return null;
-  if (typeof id === "string") return id;
-  if (typeof id.contractId === "function") return id.contractId();
-  if (typeof id.toString === "function") return id.toString();
-  return String(id);
-}
-
-function rawTopic(value) {
-  const native = nativeOrValue(value);
-  if (native === null || ["string", "number", "boolean", "bigint"].includes(typeof native)) {
-    return String(native);
-  }
-  return typeof value?.toXDR === "function" ? value.toXDR("base64") : String(native);
-}
-
-/**
- * Decode the Kitewell event topics and data for the Lab. Unrecognized or
- * malformed events retain their topics so they can still be inspected.
- */
-export function mapKitewellEvents(rawEvents = [], contractId) {
-  return (rawEvents || [])
-    .filter((event) => !contractId || eventContractId(event) === contractId)
-    .map((event) => {
-      const topic = event.topic || [];
-      const kind = topic[0] ? nativeOrValue(topic[0]) : null;
-      const value = event.value != null ? nativeOrValue(event.value) : null;
-      const common = {
-        id: event.id ?? `${event.ledger ?? event.ledgerSeq ?? 0}-${kind}`,
-        ledger: event.ledger ?? event.ledgerSeq ?? null,
-      };
-
-      const caller = topic[1] ? nativeOrValue(topic[1]) : null;
-      const addressTopic = typeof topic[1]?.switch !== "function" ||
-        topic[1].switch() === StellarSdk.xdr.ScValType.scvAddress();
-      const validCaller = typeof caller === "string" && (
-        StellarSdk.StrKey.isValidEd25519PublicKey(caller) ||
-        StellarSdk.StrKey.isValidContract(caller)
-      );
-      if (kind === "register" && addressTopic && validCaller && Array.isArray(value) &&
-          typeof value[0] === "string" && typeof value[1] === "boolean") {
-        const [name, isNew] = value;
-        return {
-          ...common,
-          type: "register",
-          functionName: "register",
-          caller,
-          name: name ?? null,
-          isNew: Boolean(isNew),
-        };
-      }
-      if (kind === "paused" && typeof value === "boolean") {
-        return { ...common, type: "paused", functionName: "set_paused", paused: value };
-      }
-      return { ...common, type: "unknown", functionName: null, topics: topic.map(rawTopic) };
-    });
-}
-
-/**
- * Fetch a page of events for the configured contract. With no cursor the tail
- * starts at `startLedger` (the ledger open at tab-open time), so the full
- * history is never downloaded.
- */
-export async function readKitewellEvents(contractId, options = {}) {
-  if (!StellarSdk.StrKey.isValidContract(contractId)) {
-    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
-  }
-
-  const { cursor, startLedger, limit = 100 } = options;
-  const request = {
-    limit,
-    filters: [{ type: "contract", contractIds: [contractId] }],
-  };
-  if (cursor) request.cursor = cursor;
-  else if (startLedger) request.startLedger = startLedger;
-  else {
-    // First open: begin at the latest ledger rather than replaying history.
-    const latest = await sorobanRpc.getLatestLedger();
-    request.startLedger = latest.sequence;
-  }
-
-  const response = await sorobanRpc.getEvents(request);
-
-  return {
-    events: mapKitewellEvents(response.events || [], contractId),
-    cursor: response.cursor ?? null,
-    latestLedger: response.latestLedger ?? null,
-  };
-}
-
-
-function hexToBytes(hex) {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i += 1) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
-
-/**
- * Read the TTL for a contract instance and its Wasm code from the ledger.
- *
- * @param {string} contractId Contract address (C…)
- * @returns {Promise<{ instanceTTL: number|null, codeTTL: number|null, wasmHash: string|null, currentLedger: number }>}
- */
-export async function readContractTTL(contractId) {
-  if (!StellarSdk.StrKey.isValidContract(contractId)) {
-    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
-  }
-
-  const contractKey = StellarSdk.xdr.LedgerKey.contractData(
-    new StellarSdk.xdr.LedgerKeyContractData({
-      contract: StellarSdk.Address.fromString(contractId).toScAddress(),
-      key: StellarSdk.xdr.ScVal.scvLedgerKeyContractInstance(),
-      durability: StellarSdk.xdr.ContractDataDurability.persistent(),
-    })
-  );
-
-  const ledgerResponse = await sorobanRpc.getLatestLedger();
-  const currentLedger = ledgerResponse.sequence;
-
-  let instanceTTL = null;
-  let codeTTL = null;
-  let wasmHash = null;
 
   try {
-    const entryResponse = await sorobanRpc.getLedgerEntries(contractKey);
-    if (entryResponse.entries && entryResponse.entries.length > 0) {
-      const entry = entryResponse.entries[0];
-      instanceTTL = entry.liveUntilLedgerSeq || null;
-
-      if (entry.val) {
-        const ledgerEntryData = StellarSdk.xdr.LedgerEntryData.fromXDR(entry.val, "base64");
-        if (ledgerEntryData.switch() === StellarSdk.xdr.LedgerEntryType.contractData()) {
-          const contractData = ledgerEntryData.contractData();
-          const val = contractData.val();
-          if (val.switch() === StellarSdk.xdr.ScValType.scvContractInstance()) {
-            const instance = val.instance();
-            const executable = instance.executable();
-            if (executable.switch() === StellarSdk.xdr.ContractExecutableType.contractExecutableWasm()) {
-              wasmHash = executable.wasmHash().toString("hex");
-
-              const codeKey = StellarSdk.xdr.LedgerKey.contractCode(
-                new StellarSdk.xdr.LedgerKeyContractCode({
-                  hash: executable.wasmHash(),
-                })
-              );
-
-              const codeResponse = await sorobanRpc.getLedgerEntries(codeKey);
-              if (codeResponse.entries && codeResponse.entries.length > 0) {
-                codeTTL = codeResponse.entries[0].liveUntilLedgerSeq || null;
-              }
-            }
-          }
-        }
-      }
+    const response = await getServer().fetch(
+      `/federation?type=name&id=${encodeURIComponent(federationId)}`,
+      { cache: "no-store" }
+    );
+    const data = await response.json();
+    if (data._embedded?.records?.[0]?.account_id) {
+      return data._embedded.records[0].account_id;
     }
   } catch (err) {
-    console.error("Error reading TTL:", err);
+    console.warn("Horizon federation resolution failed:", err);
   }
 
-  return { instanceTTL, codeTTL, wasmHash, currentLedger };
+  return null;
+}
+
+/** Stellar's protocol limit for operations in one transaction. */
+export const MAX_COMPOSED_OPERATIONS = 100;
+
+const MAX_MANAGE_DATA_NAME_BYTES = 64;
+const MAX_MANAGE_DATA_VALUE_BYTES = 64;
+
+function assertComposedEntries(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new Error("Add at least one operation before signing.");
+  }
+  if (entries.length > MAX_COMPOSED_OPERATIONS) {
+    throw new Error(
+      `A transaction can contain at most ${MAX_COMPOSED_OPERATIONS} operations.`
+    );
+  }
 }
 
 /**
- * Extend the instance TTL of a Soroban contract.
+ * Turn one composer row into an SDK operation.
  *
- * @param {string} publicKey Source account
- * @param {string} contractId Contract address (C…)
- * @param {number} extendTo New TTL ledger deadline
- * @returns {Promise<{ hash: string, deadline: number }>}
+ * Supported types: `payment`, `changeTrust`, and `manageData`. Validation
+ * happens here so the composer can reject a bad row before the wallet opens.
  */
-export async function extendInstanceTTL(publicKey, contractId, extendTo) {
-  if (!StellarSdk.StrKey.isValidContract(contractId)) {
-    throw new Error("Contract ID must be a valid Soroban contract strkey (C…).");
+export function buildComposedOperation(entry = {}) {
+  if (entry.type === "payment") {
+    if (!StellarSdk.StrKey.isValidEd25519PublicKey(entry.destination)) {
+      throw new Error("Destination must be a valid Stellar public key (G…).");
+    }
+
+    return StellarSdk.Operation.payment({
+      destination: entry.destination,
+      asset: resolvePaymentAsset(entry.asset),
+      amount: normalizeAmount(entry.amount),
+    });
   }
 
-  const { currentLedger } = await readContractTTL(contractId);
-  if (extendTo <= currentLedger) {
-    throw new Error("TTL deadline must be in the future.");
+  if (entry.type === "changeTrust") {
+    const code = String(entry.code ?? "").trim().toUpperCase();
+    if (!code || code.length > 12) {
+      throw new Error("Asset code must be 1–12 characters.");
+    }
+    if (!StellarSdk.StrKey.isValidEd25519PublicKey(entry.issuer)) {
+      throw new Error("Issuer must be a valid Stellar public key (G…).");
+    }
+
+    return StellarSdk.Operation.changeTrust({
+      asset: new StellarSdk.Asset(code, entry.issuer),
+      limit: formatTrustlineLimit(entry.limit).formatted,
+    });
   }
 
-  const sourceAccount = await sorobanRpc.getAccount(publicKey);
-  const contractKey = StellarSdk.xdr.LedgerKey.contractData(
-    new StellarSdk.xdr.LedgerKeyContractData({
-      contract: StellarSdk.Address.fromString(contractId).toScAddress(),
-      key: StellarSdk.xdr.ScVal.scvLedgerKeyContractInstance(),
-      durability: StellarSdk.xdr.ContractDataDurability.persistent(),
-    })
-  );
+  if (entry.type === "manageData") {
+    const name = String(entry.name ?? "").trim();
+    if (!name) {
+      throw new Error("Data entry name is required.");
+    }
+    if (new TextEncoder().encode(name).length > MAX_MANAGE_DATA_NAME_BYTES) {
+      throw new Error("Data entry name must be 64 UTF-8 bytes or fewer.");
+    }
 
-  const sorobanData = new StellarSdk.SorobanDataBuilder().setReadOnly([contractKey]).build();
+    const value = String(entry.value ?? "");
+    if (new TextEncoder().encode(value).length > MAX_MANAGE_DATA_VALUE_BYTES) {
+      throw new Error("Data entry value must be 64 UTF-8 bytes or fewer.");
+    }
 
-  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
-    networkPassphrase: currentPassphrase(),
-  })
-    .setSorobanData(sorobanData)
-    .addOperation(
-      StellarSdk.Operation.extendFootprintTtl({
-        extendTo: extendTo - currentLedger,
-      })
-    )
-    .setTimeout(180)
-    .build();
-
-  const prepared = await sorobanRpc.prepareTransaction(transaction);
-  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
-  const result = await sorobanRpc.sendTransaction(signedTx);
-
-  if (result.status === "ERROR") {
-    throw new Error("Instance TTL extension rejected by the network.");
+    return StellarSdk.Operation.manageData({ name, value });
   }
 
-  return { hash: result.hash, deadline: extendTo };
+  throw new Error(`Unsupported operation type: ${entry.type}`);
 }
 
 /**
- * Extend the code TTL of a Soroban contract's Wasm, separate from the instance.
- *
- * @param {string} publicKey Source account
- * @param {string} wasmHash Hex-encoded Wasm hash
- * @param {number} extendTo New TTL ledger deadline
- * @param {number} currentLedger Latest ledger sequence
- * @returns {Promise<{ hash: string, deadline: number }>}
+ * Build one transaction containing every composer row, in list order.
+ * The 100-operation protocol cap and per-row validation are enforced here.
  */
-export async function extendCodeTTL(publicKey, wasmHash, extendTo, currentLedger) {
-  if (!wasmHash || !/^[0-9a-fA-F]{64}$/.test(wasmHash)) {
-    throw new Error("Wasm hash must be exactly 64 hexadecimal characters.");
-  }
+export function buildComposedTransaction(sourceAccount, entries) {
+  assertComposedEntries(entries);
 
-  if (extendTo <= currentLedger) {
-    throw new Error("TTL deadline must be in the future.");
-  }
-
-  const sourceAccount = await sorobanRpc.getAccount(publicKey);
-  const codeKey = StellarSdk.xdr.LedgerKey.contractCode(
-    new StellarSdk.xdr.LedgerKeyContractCode({
-      hash: hexToBytes(wasmHash),
-    })
-  );
-
-  const sorobanData = new StellarSdk.SorobanDataBuilder().setReadOnly([codeKey]).build();
-
-  const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+  const builder = new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: StellarSdk.BASE_FEE,
     networkPassphrase: currentPassphrase(),
-  })
-    .setSorobanData(sorobanData)
-    .addOperation(
-      StellarSdk.Operation.extendFootprintTtl({
-        extendTo: extendTo - currentLedger,
-      })
-    )
-    .setTimeout(180)
-    .build();
+  });
 
-  const prepared = await sorobanRpc.prepareTransaction(transaction);
-  const signedTx = await signWithFreighter(prepared.toXDR(), publicKey);
-  const result = await sorobanRpc.sendTransaction(signedTx);
-
-  if (result.status === "ERROR") {
-    throw new Error("Code TTL extension rejected by the network.");
+  for (const entry of entries) {
+    builder.addOperation(buildComposedOperation(entry));
   }
 
-  return { hash: result.hash, deadline: extendTo };
+  return builder.setTimeout(180).build();
+}
+
+function horizonErrorBody(error) {
+  const body = error?.response?.data ?? error?.response;
+  if (body && typeof body === "object") return body;
+  // signAndSubmit wraps a Horizon failure and keeps the raw error as `cause`.
+  if (error?.cause) return horizonErrorBody(error.cause);
+  return null;
+}
+
+/**
+ * Horizon's zero-based index of the first failed operation in a submit error,
+ * or null when the response does not name one.
+ */
+export function getFailedOperationIndex(error) {
+  const body = horizonErrorBody(error);
+  const codes = body?.extras?.result_codes?.operations;
+  if (!Array.isArray(codes)) return null;
+
+  const index = codes.findIndex((code) => code && code !== "op_success");
+  return index === -1 ? null : index;
+}
+
+function withFailedOperationIndex(error) {
+  const index = getFailedOperationIndex(error);
+  if (index == null) return error;
+
+  const body = horizonErrorBody(error);
+  let reason = "transaction failed";
+  try {
+    reason = parseHorizonError(body).reason;
+  } catch {
+    /* keep the generic reason */
+  }
+
+  const wrapped = new Error(`Operation index ${index} failed: ${reason}`);
+  wrapped.operationIndex = index;
+  wrapped.cause = error;
+  return wrapped;
+}
+
+/**
+ * Sign the whole operation list once in Freighter and submit it to Horizon.
+ * Empty lists and lists over 100 operations are rejected before Freighter is
+ * opened. A failed submit carries `operationIndex` when Horizon names one.
+ */
+export async function submitComposedOperations(publicKey, entries) {
+  assertComposedEntries(entries);
+
+  // Validate every row before touching the wallet or the network.
+  entries.forEach((entry) => buildComposedOperation(entry));
+
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+
+  const sourceAccount = await getServer().loadAccount(publicKey);
+  const transaction = buildComposedTransaction(sourceAccount, entries);
+
+  try {
+    return await signAndSubmit(transaction, publicKey);
+  } catch (error) {
+    throw withFailedOperationIndex(error);
+  }
 }

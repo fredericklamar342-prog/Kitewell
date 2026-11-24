@@ -14,12 +14,10 @@ vi.mock("./api", () => ({
   fetchPaymentsViaApi: vi.fn(),
 }));
 
-const { loadAccountMock, paymentsCallMock, orderBookCallMock, claimableCallMock, assetCallMock } = vi.hoisted(() => ({
+const { loadAccountMock, paymentsCallMock, ledgerCallMock } = vi.hoisted(() => ({
   loadAccountMock: vi.fn(),
   paymentsCallMock: vi.fn(),
-  orderBookCallMock: vi.fn(),
-  claimableCallMock: vi.fn(),
-  assetCallMock: vi.fn(),
+  ledgerCallMock: vi.fn(),
 }));
 
 vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
@@ -31,6 +29,11 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
       Server: vi.fn(function () {
         return {
           loadAccount: loadAccountMock,
+          ledgers: () => ({
+            order: () => ({
+              limit: () => ({ call: ledgerCallMock }),
+            }),
+          }),
           payments: () => ({
             forAccount: () => ({
               limit: () => ({
@@ -62,9 +65,11 @@ const {
   explorerAccountUrl,
   explorerTxUrl,
   fundWithFriendbot,
+  getLatestLedger,
   getAccountBalances,
   getAccountDetails,
   getBalance,
+  getLatestBaseReserve,
   getTransactions,
   getOrderBook,
   parsePathAssets,
@@ -104,10 +109,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   loadAccountMock.mockReset();
   paymentsCallMock.mockReset();
-  orderBookCallMock.mockReset();
-  claimableCallMock.mockReset();
-  assetCallMock.mockReset();
-  resetHorizon429BackoffForTests();
+  ledgerCallMock.mockReset();
 });
 
 afterEach(() => {
@@ -122,6 +124,63 @@ describe("explorer urls", () => {
     );
     expect(explorerTxUrl("hash123")).toBe(
       "https://stellar.expert/explorer/testnet/tx/hash123"
+    );
+  });
+});
+
+describe("getLatestLedger", () => {
+  it("maps sequence, UTC close time, base fee, and base reserve", async () => {
+    ledgerCallMock.mockResolvedValue({
+      records: [
+        {
+          sequence: 123456,
+          closed_at: "2026-11-20T15:00:00Z",
+          base_fee_in_stroops: 100,
+          base_reserve_in_stroops: 5000000,
+        },
+      ],
+    });
+
+    await expect(getLatestLedger()).resolves.toEqual({
+      sequence: 123456,
+      closedAt: "2026-11-20T15:00:00.000Z",
+      baseFeeInStroops: "100",
+      baseReserveInStroops: "5000000",
+    });
+  });
+
+  it("uses the explicitly selected network", async () => {
+    ledgerCallMock.mockResolvedValue({
+      records: [
+        {
+          sequence: 2,
+          closed_at: "2026-11-20T15:00:00Z",
+          base_fee_in_stroops: 100,
+          base_reserve_in_stroops: 5000000,
+        },
+      ],
+    });
+
+    await getLatestLedger("FUTURENET");
+
+    expect(StellarSdk.Horizon.Server).toHaveBeenCalledWith(
+      "https://horizon-futurenet.stellar.org"
+    );
+  });
+
+  it("rejects a ledger missing its base reserve instead of treating it as zero", async () => {
+    ledgerCallMock.mockResolvedValue({
+      records: [
+        {
+          sequence: 1,
+          closed_at: "2026-11-20T15:00:00Z",
+          base_fee_in_stroops: 100,
+        },
+      ],
+    });
+
+    await expect(getLatestLedger()).rejects.toThrow(
+      "Latest ledger has an invalid base reserve."
     );
   });
 });
@@ -264,7 +323,7 @@ describe("getBalance", () => {
     });
 
     await expect(getBalance("GTEST")).resolves.toBe("3.5000000");
-    expect(fetchAccountViaApi).toHaveBeenCalledWith("GTEST");
+    expect(fetchAccountViaApi).toHaveBeenCalledWith("GTEST", "TESTNET");
   });
 
   it("falls back to Horizon and reports 0 when no native balance exists", async () => {
@@ -283,6 +342,20 @@ describe("getBalance", () => {
 
     await expect(getBalance("GTEST")).resolves.toBe("0");
     expect(loadAccountMock).toHaveBeenCalledWith("GTEST");
+  });
+});
+
+describe("getLatestBaseReserve", () => {
+  it("reads the base reserve from the latest Horizon ledger", async () => {
+    await expect(getLatestBaseReserve()).resolves.toBe("5000000");
+    expect(ledgerCallMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails explicitly when the latest ledger has no valid reserve", async () => {
+    ledgerCallMock.mockResolvedValue({ records: [] });
+    await expect(getLatestBaseReserve()).rejects.toThrow(
+      "Latest ledger did not include a valid base reserve."
+    );
   });
 });
 
@@ -326,17 +399,7 @@ describe("balance mapping", () => {
     loadAccountMock.mockResolvedValue(horizonAccountFixture());
 
     await expect(getAccountBalances("GTEST")).resolves.toEqual([
-      {
-        key: "native",
-        code: "XLM",
-        issuer: null,
-        balance: "3.5000000",
-        limit: null,
-        isNative: true,
-        sellingLiabilities: "0.0000000",
-        buyingLiabilities: "0.0000000",
-        available: "1.5000000", // 3.5 - (0.5 * (2 + 2)) = 1.5
-      },
+      { key: "native", code: "XLM", issuer: null, balance: "3.5000000", limit: null, isNative: true, sellingLiabilities: "0", buyingLiabilities: "0" },
       {
         key: "FOO:GISSUER",
         code: "FOO",
@@ -344,12 +407,8 @@ describe("balance mapping", () => {
         balance: "11.0000000",
         limit: "1000.0000000",
         isNative: false,
-        isAuthorized: false,
-        isAuthorizedToMaintainLiabilities: true,
-        clawbackEnabled: false,
-        sellingLiabilities: "0.0000000",
-        buyingLiabilities: "0.0000000",
-        available: "11.0000000",
+        sellingLiabilities: "0",
+        buyingLiabilities: "0",
       },
     ]);
   });
@@ -519,7 +578,12 @@ describe("getTransactions", () => {
     fetchPaymentsViaApi.mockResolvedValue(page);
 
     await expect(getTransactions("GTEST")).resolves.toEqual(page);
-    expect(fetchPaymentsViaApi).toHaveBeenCalledWith("GTEST", 15, undefined);
+    expect(fetchPaymentsViaApi).toHaveBeenCalledWith(
+      "GTEST",
+      15,
+      undefined,
+      "TESTNET"
+    );
   });
 
   it("filters to payments and defaults non-native asset codes to XLM on fallback", async () => {
@@ -560,46 +624,78 @@ describe("getTransactions", () => {
   });
 });
 
-describe("getClaimableBalances", () => {
-  it("lists only creator balances and enables clawback only for an issuer asset", async () => {
-    const { getClaimableBalances } = await import("./stellar");
-    claimableCallMock.mockResolvedValue({
-      records: [
+describe("balance liabilities", () => {
+  it("includes selling and buying liabilities from Horizon with defaults", async () => {
+    fetchAccountViaApi.mockRejectedValue(new Error("backend down"));
+    loadAccountMock.mockResolvedValue({
+      id: "GTEST",
+      sequenceNumber: () => "123",
+      subentry_count: 2,
+      thresholds: { low_threshold: 0, med_threshold: 0, high_threshold: 0 },
+      balances: [
         {
-          id: "a".repeat(64),
-          asset: "KITE:GTEST",
-          amount: "4.0000000",
-          sponsor: "GCREATOR",
-          last_modified_time: "2026-01-01T00:00:00Z",
+          asset_type: "native",
+          balance: "100.0000000",
+          selling_liabilities: "10.5000000",
+          buying_liabilities: "5.2500000",
         },
-        { id: "b".repeat(64), asset: "KITE:GOTHER", amount: "2", sponsor: "OTHER" },
+        {
+          asset_type: "credit_alphanum4",
+          asset_code: "USDC",
+          asset_issuer: "GISSUER",
+          balance: "1000.0000000",
+          limit: "5000.0000000",
+          selling_liabilities: "200.0000000",
+          buying_liabilities: "100.0000000",
+        },
       ],
     });
-    assetCallMock.mockResolvedValue({
-      records: [{ flags: { auth_clawback_enabled: true } }],
-    });
 
-    await expect(getClaimableBalances("GCREATOR")).resolves.toEqual([
-      expect.objectContaining({
-        id: "a".repeat(64),
-        code: "KITE",
-        issuer: "GTEST",
-        createdByAccount: true,
-        clawbackEnabled: true,
-      }),
+    const balances = await getAccountBalances("GTEST");
+
+    expect(balances).toEqual([
+      {
+        key: "native",
+        code: "XLM",
+        issuer: null,
+        balance: "100.0000000",
+        limit: null,
+        isNative: true,
+        sellingLiabilities: "10.5000000",
+        buyingLiabilities: "5.2500000",
+      },
+      {
+        key: "USDC:GISSUER",
+        code: "USDC",
+        issuer: "GISSUER",
+        balance: "1000.0000000",
+        limit: "5000.0000000",
+        isNative: false,
+        sellingLiabilities: "200.0000000",
+        buyingLiabilities: "100.0000000",
+      },
     ]);
-    expect(claimableCallMock).toHaveBeenCalledTimes(1);
   });
 
-  it("hides clawback when the issuer asset does not allow clawback", async () => {
-    const { getClaimableBalances } = await import("./stellar");
-    claimableCallMock.mockResolvedValue({
-      records: [{ id: "c".repeat(64), asset: "KITE:GISSUER", sponsor: "GISSUER" }],
+  it("defaults missing liability fields to zero", async () => {
+    fetchAccountViaApi.mockRejectedValue(new Error("backend down"));
+    loadAccountMock.mockResolvedValue({
+      id: "GTEST",
+      sequenceNumber: () => "123",
+      subentry_count: 1,
+      thresholds: { low_threshold: 0, med_threshold: 0, high_threshold: 0 },
+      balances: [
+        {
+          asset_type: "native",
+          balance: "50.0000000",
+          // selling_liabilities and buying_liabilities omitted
+        },
+      ],
     });
-    assetCallMock.mockResolvedValue({ records: [{ flags: { auth_clawback_enabled: false } }] });
 
-    await expect(getClaimableBalances("GISSUER")).resolves.toEqual([
-      expect.objectContaining({ clawbackEnabled: false }),
-    ]);
+    const balances = await getAccountBalances("GTEST");
+
+    expect(balances[0].sellingLiabilities).toBe("0");
+    expect(balances[0].buyingLiabilities).toBe("0");
   });
 });

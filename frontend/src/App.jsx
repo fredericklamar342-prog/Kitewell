@@ -1,17 +1,20 @@
-import { useState, useCallback, useEffect, useRef, useMemo } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
+import * as StellarSdk from "@stellar/stellar-sdk";
 import {
   checkFreighterInstalled,
   connectFreighterWallet,
   buildPaymentEnvelope,
   submitEnvelopeWithFreighter,
-  sendPaymentWithFreighter,
+  createAccountWithFreighter,
   pathPaymentWithFreighter,
   changeOfferPriceWithFreighter,
   changeTrustWithFreighter,
   clawbackClaimableBalanceWithFreighter,
   readKitewellState,
   registerBuilderWithFreighter,
-  simulateRegisterBuilder,
+  submitComposedOperations,
+  buildComposedOperation,
+  MAX_COMPOSED_OPERATIONS,
   setAccountOptionsWithFreighter,
   allowTrustWithFreighter,
   readContractInstanceTtl,
@@ -26,11 +29,8 @@ import {
   createFailedSubmitLog,
   downloadFailedSubmitLog,
 } from "./failedSubmitLog";
-import {
-  shortenAddress,
-  buildMuxedAddress,
-  splitMuxedAddress,
-} from "./addressFormat";
+import { copyToClipboardResult } from "./copyToClipboardResult";
+import { shortenAddress } from "./addressFormat";
 import {
   fundWithFriendbot,
   buildAsset,
@@ -40,16 +40,12 @@ import {
   getPendingTransactions,
   getClaimableBalances,
   getLiquidityPool,
-  getOrderBook,
+  getLatestBaseReserve,
   getTransactions,
+  getFeeStats,
   explorerAccountUrl,
   explorerTxUrl,
-  isHorizonSlowdownError,
-  HORIZON_SLOWDOWN_MESSAGE,
-  statusWatchHref,
-  getAccountAuthConfig,
-  getIssuedAssetTrustlines,
-  IMMUTABLE_CONFIRMATION,
+  resolveFederationAddress,
 } from "./stellar";
 import {
   clearStoredOrderBookPair,
@@ -58,6 +54,13 @@ import {
   saveOrderBookPair,
 } from "./orderBookPair";
 import { poolShareRows } from "./poolShare";
+import {
+  calculateMinimumBalance,
+  formatStroops,
+  minimumBalanceInStroops,
+  parseXlmToStroops,
+  remainsAboveMinimum,
+} from "./accountReserve";
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { filterTransactionHistory } from "./txHistoryFilter";
 import { fetchHealth, fetchNetworkInfo } from "./api";
@@ -70,18 +73,9 @@ import {
   setActiveNetwork,
 } from "./network";
 import { validateAssetCode } from "./validateAssetCode";
-import { checkThresholds } from "./thresholdCheck";
+import { fetchPathQuote, formatPathHops } from "./paths";
 import { decodeTransactionEnvelope } from "./txInspector";
-import TransactionHashLookup from "./TransactionHashLookup";
-import { completeWebAuthChallenge } from "./sep10WebAuth";
-import { loadIssuerCurrencyList } from "./issuerToml";
-import { createPaymentStreamController } from "./paymentStream";
-import {
-  normaliseTxHash,
-  txStatusPresentation,
-  watchTransactionStatus,
-} from "./txStatusWatch";
-import { buildTransactionExplorerUrl } from "./explorerLink";
+import TransactionFailureNotice from "./TransactionFailureNotice";
 import "./App.css";
 
 const TABS = [
@@ -95,6 +89,7 @@ const TABS = [
   "Offer",
   "Book",
   "History",
+  "Fees",
   "Pending",
   "Inspect",
   "Decode",
@@ -103,6 +98,11 @@ const TABS = [
   "Muxed",
   "Lab",
   "Issue",
+];
+const FEE_PERCENTILES = [
+  { key: "mode", label: "Mode" },
+  { key: "p10", label: "p10" },
+  { key: "p99", label: "p99" },
 ];
 const PENDING_REFRESH_MS = 8000;
 const EVENT_POLL_MS = 6000;
@@ -156,21 +156,24 @@ export default function App() {
   const [historyError, setHistoryError] = useState(null);
   const [loading, setLoading] = useState("");
   const [toast, setToast] = useState(null);
+  const [transactionFailure, setTransactionFailure] = useState(null);
   const [sendForm, setSendForm] = useState({
     destination: "",
     amount: "",
     assetKey: "native",
     memoType: "text",
     memo: "",
+    minTime: "",
+    maxTime: "",
   });
   const [trustForm, setTrustForm] = useState({ code: "", issuer: "", limit: "1000000" });
-  const [limitChangeForm, setLimitChangeForm] = useState({});
-  const [openOffers, setOpenOffers] = useState([]);
-  const [offerPrices, setOfferPrices] = useState({});
-  const [offerError, setOfferError] = useState(null);
-  const [offerLoading, setOfferLoading] = useState(false);
-  const [offerRefresh, setOfferRefresh] = useState(0);
-  const [offerResult, setOfferResult] = useState(null);
+  const [createAccountForm, setCreateAccountForm] = useState({
+    destination: "",
+    startingBalance: "",
+  });
+  const [baseReserveInStroops, setBaseReserveInStroops] = useState(null);
+  const [reserveError, setReserveError] = useState(null);
+  const [reserveSubentryCount, setReserveSubentryCount] = useState("0");
   const [pathForm, setPathForm] = useState({
     mode: "strictSend",
     destination: "",
@@ -190,20 +193,7 @@ export default function App() {
     amount: "",
   });
   const [pathResult, setPathResult] = useState(null);
-  const [offerForm, setOfferForm] = useState({
-    sellingType: "native",
-    sellingCode: "",
-    sellingIssuer: "",
-    buyingType: "credit",
-    buyingCode: "",
-    buyingIssuer: "",
-    price: "",
-  });
-  const [orderBook, setOrderBook] = useState(null);
-  const [orderBookError, setOrderBookError] = useState(null);
-  const [bookPair, setBookPair] = useState(readStoredOrderBookPair);
-  const [bookResult, setBookResult] = useState(null);
-  const bookClearGenerationRef = useRef(0);
+  const [pathQuote, setPathQuote] = useState(null);
   const [unsignedEnvelope, setUnsignedEnvelope] = useState(null);
   const [labInfo, setLabInfo] = useState(null);
   const [labError, setLabError] = useState(null);
@@ -211,79 +201,27 @@ export default function App() {
   const [simulatedRegisterKey, setSimulatedRegisterKey] = useState(null);
   const [labState, setLabState] = useState(null);
   const [labStateError, setLabStateError] = useState(null);
+  const [rpcHealth, setRpcHealth] = useState({
+    ok: null,
+    description: "checking",
+    latestLedger: null,
+    error: null,
+  });
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
-  const [muxedBuildForm, setMuxedBuildForm] = useState({ gAddress: "", id: "" });
-  const [muxedBuildResult, setMuxedBuildResult] = useState(null);
-  const [muxedSplitForm, setMuxedSplitForm] = useState({ mAddress: "" });
-  const [muxedSplitResult, setMuxedSplitResult] = useState(null);
-  const [muxedError, setMuxedError] = useState(null);
+  const [lastLabTx, setLastLabTx] = useState(null);
   const [inspectForm, setInspectForm] = useState({ xdr: "" });
   const [inspectResult, setInspectResult] = useState(null);
   const [inspectError, setInspectError] = useState(null);
-  const [envelopeXdr, setEnvelopeXdr] = useState("");
-  const [decodedEnvelope, setDecodedEnvelope] = useState(null);
-  const [decodeError, setDecodeError] = useState(null);
+  const [sessionContractId, setSessionContractId] = useState(null);
+  const [deployedContracts, setDeployedContracts] = useState([]);
+  const [wasmFile, setWasmFile] = useState(null);
+  const [confirmRedeploy, setConfirmRedeploy] = useState(false);
+  const [deployError, setDeployError] = useState(null);
   const tabRefs = useRef([]);
   const horizonAbortRef = useRef(null);
   const [accountDetails, setAccountDetails] = useState(null);
-  const [selectedSigners, setSelectedSigners] = useState([]);
-  const [horizonNotice, setHorizonNotice] = useState(null);
-  const [failedSubmits, setFailedSubmits] = useState([]);
-  const failedSubmitLogRef = useRef(createFailedSubmitLog());
-  const [webAuthForm, setWebAuthForm] = useState({ endpoint: "", serverAccount: "" });
-  const [webAuthResult, setWebAuthResult] = useState(null);
-  const [webAuthError, setWebAuthError] = useState(null);
-  const [issuerInput, setIssuerInput] = useState("");
-  const [issuerResult, setIssuerResult] = useState(null);
-  const [issuerError, setIssuerError] = useState(null);
-  const [streamedPayments, setStreamedPayments] = useState([]);
-  const [streamState, setStreamState] = useState(null);
-  const [txWatch, setTxWatch] = useState(null);
-  const [txWatchError, setTxWatchError] = useState(null);
-  const [hashForm, setHashForm] = useState("");
-  const [hashError, setHashError] = useState(null);
-  const streamSessionRef = useRef(null);
-  const watchTokenRef = useRef(0);
-
-  // Issue #512: the controller owns the streamed payments and their paging
-  // tokens, so a duplicate event can never reach the list twice; this only
-  // mirrors its state into React.
-  const paymentStream = useMemo(
-    () =>
-      createPaymentStreamController({
-        onChange: (records, state) => {
-          setStreamedPayments(records);
-          setStreamState(state);
-        },
-      }),
-    []
-  );
-
-  // Issuer auth flags + trustlines the connected account issued.
-  const [issuerConfig, setIssuerConfig] = useState(null);
-  const [issuerConfigError, setIssuerConfigError] = useState(null);
-  const [issuerForm, setIssuerForm] = useState({
-    homeDomain: "",
-    authRequired: false,
-    authRevocable: false,
-    authImmutable: false,
-    confirmation: "",
-  });
-  const [issuedTrustlines, setIssuedTrustlines] = useState([]);
-  const [issuedTrustlinesError, setIssuedTrustlinesError] = useState(null);
-
-  // Contract instance TTL + event tail in the Lab tab.
-  const [ttlInfo, setTtlInfo] = useState(null);
-  const [ttlError, setTtlError] = useState(null);
-  const [ttlForm, setTtlForm] = useState({ extendTo: "" });
-  const [ttlResult, setTtlResult] = useState(null);
-  const [codeTtl, setCodeTtl] = useState(null);
-  const [codeTtlError, setCodeTtlError] = useState(null);
-  const [labEvents, setLabEvents] = useState([]);
-  const [labEventsError, setLabEventsError] = useState(null);
-  const eventCursorRef = useRef(null);
-  const eventStartLedgerRef = useRef(null);
+  const [resolvedFederation, setResolvedFederation] = useState(null);
 
   const showToast = (message, type = "success", explorerUrl = null) => {
     setToast({ message, type, explorerUrl });
@@ -324,6 +262,20 @@ export default function App() {
   const activeNetwork = NETWORKS[networkId];
   const friendbotAvailable = isFriendbotAvailable();
   const pathModeField = PATH_MODE_FIELDS[pathForm.mode];
+  const pathSendAsset = {
+    isNative: pathForm.sendAssetType === "native",
+    code: pathForm.sendCode,
+    issuer: pathForm.sendIssuer,
+  };
+  const pathDestAsset = {
+    isNative: pathForm.destAssetType === "native",
+    code: pathForm.destCode,
+    issuer: pathForm.destIssuer,
+  };
+  const updatePathForm = (changes) => {
+    setPathForm((prev) => ({ ...prev, ...changes }));
+    // Editing the request invalidates any quote from the previous form state.
+    setPathQuote(null);
   const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
   const updateOfferForm = (changes) => setOfferForm((prev) => ({ ...prev, ...changes }));
   // Any edit changes the operation list, so the previewed envelope is stale.
@@ -332,15 +284,7 @@ export default function App() {
     setUnsignedEnvelope(null);
   };
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
-  const muxedSendBase = (() => {
-    const value = sendForm.destination.trim();
-    if (!value) return null;
-    try {
-      return splitMuxedAddress(value).gAddress;
-    } catch {
-      return null;
-    }
-  })();
+  const selectedComposeAsset = balances.find((b) => b.key === composeForm.assetKey);
   const configuredContractId = labInfo?.network?.contract?.kitewell;
   const parsedBookPair = parseOrderBookPair(bookPair);
   const bookKey = JSON.stringify([networkId, bookPair.selling, bookPair.buying]);
@@ -528,16 +472,14 @@ export default function App() {
       try {
         const details = await getAccountDetails(publicKey, { signal });
         setAccountDetails(details);
-      } catch (detailsError) {
-        if (detailsError?.name === "AbortError") return;
-        if (isHorizonSlowdownError(detailsError)) {
-          setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
-          showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
+        if (Number.isInteger(details.subentryCount)) {
+          setReserveSubentryCount(String(details.subentryCount));
         }
+      } catch {
         setAccountDetails(null);
       }
-    } catch (error) {
-      if (error?.name === "AbortError") return;
+      await refreshReserve();
+    } catch {
       setBalances([]);
       setClaimableBalances([]);
       if (isHorizonSlowdownError(error)) {
@@ -550,7 +492,7 @@ export default function App() {
     } finally {
       setLoading("");
     }
-  }, [publicKey]);
+  }, [publicKey, refreshReserve]);
 
   const handleClawback = async (balance) => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -572,6 +514,7 @@ export default function App() {
     setLoading("connect");
     try {
       const address = await connectFreighterWallet();
+      submitGuardRef.current.reset();
       setPublicKey(address);
       setBalances([]);
       setOpenOffers([]);
@@ -586,12 +529,24 @@ export default function App() {
       setSimulatedRegisterKey(null);
       setPendingTransactions([]);
       setPendingError(null);
+      setAccountDetails(null);
+      setReserveSubentryCount("0");
+      await refreshReserve();
       showToast("Freighter connected.");
       try {
         const next = await getAccountBalances(address);
         setBalances(next);
       } catch {
         /* unfunded until Friendbot */
+      }
+      try {
+        const details = await getAccountDetails(address);
+        setAccountDetails(details);
+        if (Number.isInteger(details.subentryCount)) {
+          setReserveSubentryCount(String(details.subentryCount));
+        }
+      } catch {
+        setAccountDetails(null);
       }
     } catch (e) {
       showToast(e.message || "Failed to connect Freighter.", "error");
@@ -628,6 +583,7 @@ export default function App() {
       cancelHorizonReads();
       setHorizonNotice(null);
       const next = setActiveNetwork(id);
+      submitGuardRef.current.reset();
       setNetworkId(id);
       setBalances([]);
       setOpenOffers([]);
@@ -642,10 +598,16 @@ export default function App() {
       setSimulatedRegisterKey(null);
       setPendingError(null);
       setAccountDetails(null);
+      setComposeResult(null);
+      setComposeError(null);
       setInspectResult(null);
       setInspectError(null);
+      setBaseReserveInStroops(null);
+      setReserveError(null);
+      setReserveSubentryCount("0");
       showToast(`Switched to ${next.label}. Refresh to load balances.`, "info");
       if (publicKey) refreshBalances();
+      else if (activeTab === "Assets") refreshReserve();
     } catch (e) {
       showToast(e.message || "Could not switch network.", "error");
     }
@@ -706,6 +668,30 @@ export default function App() {
     }
   };
 
+  const handleCreateAccount = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading("create-account");
+    try {
+      const result = await createAccountWithFreighter(
+        publicKey,
+        createAccountForm.destination,
+        createAccountForm.startingBalance
+      );
+      setCreateAccountForm({ destination: "", startingBalance: "" });
+      await refreshBalances();
+      showToast(
+        `Account created · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+    } catch (error) {
+      showToast(error.message || "Account creation failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
   const handleTrust = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -716,16 +702,19 @@ export default function App() {
     try {
       code = validateAssetCode(trustForm.code);
     } catch (err) {
+      setTransactionFailure(null);
       return showToast(err.message, "error");
     }
+    setTransactionFailure(null);
     setLoading("trust");
     try {
       const result = await changeTrustWithFreighter(
         publicKey,
         code,
         trustForm.issuer,
-        trustForm.limit || "1000000"
+        limit
       );
+      trackSubmission(result.hash, "changeTrust");
       const next = await getAccountBalances(publicKey);
       setBalances(next);
       setTrustForm({ code: "", issuer: "", limit: "1000000" });
@@ -733,8 +722,10 @@ export default function App() {
       startTxWatch(result.hash);
     } catch (err) {
       trackFailedSubmit("changeTrust", err);
+      setTransactionFailure(err.transactionFailure ?? null);
       showToast(err.message || "Change trust failed.", "error");
     } finally {
+      submitGuardRef.current.end("trust");
       setLoading("");
     }
   };
@@ -830,6 +821,7 @@ export default function App() {
       );
     }
 
+    setTransactionFailure(null);
     setLoading(`remove-${asset.key}`);
     try {
       const result = await changeTrustWithFreighter(publicKey, asset.code, asset.issuer, "0");
@@ -839,8 +831,10 @@ export default function App() {
       startTxWatch(result.hash);
     } catch (err) {
       trackFailedSubmit("changeTrust", err);
+      setTransactionFailure(err.transactionFailure ?? null);
       showToast(err.message || `Could not remove the ${asset.code} trustline.`, "error");
     } finally {
+      submitGuardRef.current.end(guardKey);
       setLoading("");
     }
   };
@@ -956,12 +950,28 @@ export default function App() {
       return;
     }
 
+    setTransactionFailure(null);
     setLoading("send");
+    let paymentDestination;
     try {
-      const result = await submitEnvelopeWithFreighter(
-        unsignedEnvelope,
-        publicKey
+      paymentDestination = await resolveFederationAddress(sendForm.destination);
+    } catch (err) {
+      setLoading("");
+      return showToast(err.message || "Federation lookup failed.", "error");
+    }
+
+    try {
+      const result = await sendPaymentWithFreighter(
+        publicKey,
+        paymentDestination,
+        amount,
+        asset,
+        sendForm.memoType,
+        sendForm.memo,
+        minTime,
+        maxTime
       );
+      trackSubmission(result.hash, "payment");
       const next = await getAccountBalances(publicKey);
       setBalances(next);
       setSendForm({
@@ -970,6 +980,8 @@ export default function App() {
         assetKey: "native",
         memoType: "text",
         memo: "",
+        minTime: "",
+        maxTime: "",
       });
       setUnsignedEnvelope(null);
       showToast(
@@ -980,10 +992,55 @@ export default function App() {
       startTxWatch(result.hash);
     } catch (err) {
       trackFailedSubmit("payment", err);
+      setTransactionFailure(err.transactionFailure ?? null);
       showToast(err.message || "Payment failed.", "error");
+    } finally {
+      submitGuardRef.current.end("send");
+      setLoading("");
+    }
+  };
+
+  const handlePathQuote = async () => {
+    if (!pathForm.destination || !pathForm.amount) {
+      return showToast("Destination and amount are required for a quote.", "error");
+    }
+    if (pathForm.sendAssetType === "credit" && (!pathForm.sendCode || !pathForm.sendIssuer)) {
+      return showToast("Send asset code and issuer are required.", "error");
+    }
+    if (pathForm.destAssetType === "credit" && (!pathForm.destCode || !pathForm.destIssuer)) {
+      return showToast("Destination asset code and issuer are required.", "error");
+    }
+
+    setLoading("pathquote");
+    setPathQuote(null);
+    try {
+      const paths = await fetchPathQuote({
+        mode: pathForm.mode,
+        sendAsset: pathSendAsset,
+        destAsset: pathDestAsset,
+        destination: pathForm.destination,
+        amount: pathForm.amount,
+      });
+      setPathQuote({
+        paths,
+        error: paths.length
+          ? null
+          : "Horizon found no path for this asset pair and amount.",
+      });
+    } catch (err) {
+      setPathQuote({ paths: [], error: err.message || "Path lookup failed." });
     } finally {
       setLoading("");
     }
+  };
+
+  const handleUsePath = (path) => {
+    const hops = formatPathHops(path);
+    setPathForm((prev) => ({ ...prev, path: hops }));
+    showToast(
+      hops ? `Path applied: ${hops}` : "Direct path applied.",
+      "info"
+    );
   };
 
   const handlePathPayment = async (e) => {
@@ -999,29 +1056,48 @@ export default function App() {
       return showToast("Destination asset code and issuer are required.", "error");
     }
 
+    const fingerprint = [
+      pathForm.mode,
+      pathForm.destination,
+      pathForm.amount,
+      pathForm.bound,
+      pathForm.sendAssetType,
+      pathForm.sendCode,
+      pathForm.sendIssuer,
+      pathForm.destAssetType,
+      pathForm.destCode,
+      pathForm.destIssuer,
+      pathForm.path,
+    ].join("|");
+    const gate = submitGuardRef.current.begin("path", fingerprint);
+    if (!gate.allowed) return;
+    if (
+      gate.duplicate &&
+      !confirmDuplicate(
+        "You submitted this exact path payment in the last 15 seconds. Submit it again?"
+      )
+    ) {
+      submitGuardRef.current.end("path");
+      return;
+    }
+
     setLoading("path");
+    setTransactionFailure(null);
     setPathResult(null);
     try {
       const result = await pathPaymentWithFreighter({
         publicKey,
         destination: pathForm.destination,
         mode: pathForm.mode,
-        sendAsset: {
-          isNative: pathForm.sendAssetType === "native",
-          code: pathForm.sendCode,
-          issuer: pathForm.sendIssuer,
-        },
-        destAsset: {
-          isNative: pathForm.destAssetType === "native",
-          code: pathForm.destCode,
-          issuer: pathForm.destIssuer,
-        },
+        sendAsset: pathSendAsset,
+        destAsset: pathDestAsset,
         amount: pathForm.amount,
         destMin: pathForm.mode === "strictSend" ? pathForm.bound : undefined,
         sendMax: pathForm.mode === "strictReceive" ? pathForm.bound : undefined,
         path: pathForm.path,
       });
 
+      trackSubmission(result.hash, "pathPayment");
       setPathResult({
         hash: result.hash,
         explorerUrl: explorerTxUrl(result.hash),
@@ -1036,8 +1112,100 @@ export default function App() {
       startTxWatch(result.hash);
     } catch (err) {
       trackFailedSubmit("pathPayment", err);
+      setTransactionFailure(err.transactionFailure ?? null);
       showToast(err.message || "Path payment failed.", "error");
     } finally {
+      submitGuardRef.current.end("path");
+      setLoading("");
+    }
+  };
+
+  const handleClawback = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    const asset = clawbackAssets.find(
+      (candidate) => candidate.key === clawbackForm.assetKey
+    );
+    if (!asset) {
+      return showToast(
+        "Choose an asset you issue with clawback enabled.",
+        "error"
+      );
+    }
+    if (!clawbackForm.holder || !clawbackForm.amount) {
+      return showToast("Holder and amount are required.", "error");
+    }
+
+    const gate = submitGuardRef.current.begin(
+      "clawback",
+      `${asset.key}|${clawbackForm.holder}|${clawbackForm.amount}`
+    );
+    if (!gate.allowed) return;
+
+    setLoading("clawback");
+    try {
+      const result = await clawbackWithFreighter(
+        publicKey,
+        clawbackForm.holder,
+        asset.code,
+        asset.issuer,
+        clawbackForm.amount
+      );
+      trackSubmission(result.hash, "clawback");
+      setClawbackForm((previous) => ({
+        ...previous,
+        holder: "",
+        amount: "",
+      }));
+      showToast(
+        `Clawback submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+    } catch (err) {
+      showToast(err.message || "Clawback failed.", "error");
+    } finally {
+      submitGuardRef.current.end("clawback");
+      setLoading("");
+    }
+  };
+
+  const handleSponsor = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!sponsorForm.sponsoredAccount) {
+      return showToast("Sponsored account is required.", "error");
+    }
+    if (!sponsorForm.code || !sponsorForm.issuer) {
+      return showToast("Asset code and issuer are required.", "error");
+    }
+
+    const gate = submitGuardRef.current.begin(
+      "sponsor",
+      `${sponsorForm.sponsoredAccount}|${sponsorForm.code}|${sponsorForm.issuer}`
+    );
+    if (!gate.allowed) return;
+
+    setLoading("sponsor");
+    try {
+      const result = await sponsorTrustlineWithFreighter({
+        publicKey,
+        sponsoredAccount: sponsorForm.sponsoredAccount,
+        assetCode: sponsorForm.code,
+        assetIssuer: sponsorForm.issuer,
+      });
+      trackSubmission(result.hash, "sponsorTrustline");
+      setSponsorForm({ sponsoredAccount: "", code: "", issuer: "" });
+      showToast(
+        `Sponsored trustline submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+    } catch (err) {
+      showToast(err.message || "Sponsored trustline failed.", "error");
+    } finally {
+      submitGuardRef.current.end("sponsor");
       setLoading("");
     }
   };
@@ -1061,35 +1229,132 @@ export default function App() {
     }
   };
 
-  const handleOfferPriceChange = async (event, offer) => {
-    event.preventDefault();
+  const buildComposerEnvelope = async () => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
-    const newPrice = offerPrices[offer.id]?.trim();
-    setLoading("offer");
-    setOfferResult(null);
+    if (!composerForm.destination) {
+      return showToast("Destination is required.", "error");
+    }
+    let amount;
     try {
-      const result = await changeOfferPriceWithFreighter(publicKey, offer, newPrice);
-      setOfferResult({
-        id: offer.id,
-        oldPrice: result.oldPrice,
-        newPrice,
-        hash: result.hash,
-      });
-      setOfferPrices((previous) => ({ ...previous, [offer.id]: "" }));
-      setOfferRefresh((count) => count + 1);
-      showToast(`Offer ${offer.id} price change submitted.`);
-      startTxWatch(result.hash);
-    } catch (error) {
-      trackFailedSubmit("manageSellOffer", error);
-      showToast(error.message || "Could not change offer price.", "error");
+      amount = validatePaymentAmount(composerForm.amount);
+    } catch (err) {
+      return showToast(err.message, "error");
+    }
+    if (
+      composerForm.memoType === "text" &&
+      new TextEncoder().encode(composerForm.memo).length > 28
+    ) {
+      return showToast("Text memos must be 28 UTF-8 bytes or fewer.", "error");
+    }
+
+    const selected = balances.find((b) => b.key === composerForm.assetKey);
+    if (!selected) {
+      return showToast("Choose an asset you hold a trustline for.", "error");
+    }
+
+    const asset = selected.isNative
+      ? { isNative: true }
+      : { isNative: false, code: selected.code, issuer: selected.issuer };
+
+    setLoading("composer");
+    try {
+      const transactionMemo = createMemoForComposer(composerForm.memoType, composerForm.memo);
+      const sourceAccount = await getServerForComposer().loadAccount(publicKey);
+      const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
+        fee: StellarSdk.BASE_FEE,
+        networkPassphrase: getCurrentPassphrase(),
+      }).addOperation(
+        StellarSdk.Operation.payment({
+          destination: composerForm.destination,
+          asset: resolvePaymentAsset(asset),
+          amount: amount.toString(),
+        })
+      );
+
+      if (transactionMemo) {
+        txBuilder.addMemo(transactionMemo);
+      }
+
+      const transaction = txBuilder.setTimeout(180).build();
+      const envelopeXdr = transaction.toXDR();
+      setComposerEnvelope(envelopeXdr);
+      showToast("Envelope built. Copy the SEP-7 URI below.");
+    } catch (err) {
+      showToast(err.message || "Failed to build envelope.", "error");
     } finally {
       setLoading("");
     }
   };
 
-  const selectBookPrice = (row) => {
-    const price = row.price ?? (Number(row.priceR?.n) / Number(row.priceR?.d)).toString();
-    updateOfferForm({ price });
+  const copyComposerUri = async () => {
+    if (!composerEnvelope) return showToast("No envelope to copy.", "error");
+    try {
+      const uri = buildSep7TxUri(composerEnvelope, getCurrentPassphrase());
+      await navigator.clipboard.writeText(uri);
+      showToast("SEP-7 URI copied to clipboard.");
+    } catch (err) {
+      showToast(err.message || "Failed to copy URI.", "error");
+    }
+  };
+
+  const handleDecoderPaste = () => {
+    setDecoderError(null);
+    setDecoderEnvelope(null);
+    setDecoderDetails(null);
+    setDecoderConfirmed(false);
+    if (!decoderInput.trim()) return;
+    try {
+      const envelopeXdr = parseSep7TxUri(decoderInput.trim(), getCurrentPassphrase());
+
+      // Decode the envelope to get details
+      const transaction = StellarSdk.TransactionBuilder.fromXDR(envelopeXdr, getCurrentPassphrase());
+      const source = transaction.sourceAccount || "Unknown";
+      const fee = transaction.fee || "0";
+      const operationCount = transaction.operations?.length || 0;
+      const isSigned = transaction.signatures && transaction.signatures.length > 0;
+
+      setDecoderDetails({ source, fee, operationCount, isSigned });
+      setDecoderEnvelope(envelopeXdr);
+      showToast("Envelope loaded into decoder.");
+    } catch (err) {
+      setDecoderError(err.message);
+      showToast(err.message, "error");
+    }
+  };
+
+  const handleDecoderSubmit = async () => {
+    if (!decoderEnvelope || !decoderConfirmed) return;
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+
+    setDecoderSubmitting(true);
+    try {
+      const result = await submitEnvelope(decoderEnvelope, publicKey);
+      setDecoderEnvelope(null);
+      setDecoderDetails(null);
+      setDecoderConfirmed(false);
+      setDecoderInput("");
+      showToast(
+        `Transaction submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+      // Refresh balances after submission
+      const next = await getAccountBalances(publicKey);
+      setBalances(next);
+    } catch (err) {
+      showToast(err.message || "Submit failed.", "error");
+    } finally {
+      setDecoderSubmitting(false);
+    }
+  };
+
+  const handleDecoderCancel = () => {
+    setDecoderEnvelope(null);
+    setDecoderDetails(null);
+    setDecoderConfirmed(false);
+    setDecoderInput("");
+    setDecoderError(null);
+    showToast("Decoder cleared.");
   };
 
   const handleHistory = async () => {
@@ -1258,15 +1523,71 @@ export default function App() {
     publicKey,
   });
   const currentHistoryCursor = pageCursors[pageCursors.length - 1];
+  const actualSubentryCount = accountDetails?.subentryCount;
+  const sourceMinimumStroops =
+    baseReserveInStroops != null && Number.isInteger(actualSubentryCount)
+      ? minimumBalanceInStroops(baseReserveInStroops, actualSubentryCount)
+      : null;
+  const trustlineAlreadyExists = balances.some(
+    (balance) =>
+      !balance.isNative &&
+      balance.code === trustForm.code.trim().toUpperCase() &&
+      balance.issuer === trustForm.issuer.trim()
+  );
+  const trustlineMinimum =
+    baseReserveInStroops != null && Number.isInteger(actualSubentryCount)
+      ? minimumBalanceInStroops(
+          baseReserveInStroops,
+          actualSubentryCount + (trustlineAlreadyExists ? 0 : 1)
+        )
+      : null;
+  let createAccountAffordable = false;
+  let createAccountDestinationAffordable = false;
+  let createAccountCheckError = null;
+  if (
+    sourceMinimumStroops != null &&
+    xlmBalance != null &&
+    createAccountForm.startingBalance
+  ) {
+    try {
+      createAccountAffordable = remainsAboveMinimum(
+        xlmBalance,
+        createAccountForm.startingBalance,
+        TRANSACTION_FEE_STROOPS,
+        sourceMinimumStroops
+      );
+      createAccountDestinationAffordable =
+        parseXlmToStroops(createAccountForm.startingBalance, "Starting balance") >=
+        minimumBalanceInStroops(baseReserveInStroops, 0);
+    } catch (error) {
+      createAccountAffordable = false;
+      createAccountDestinationAffordable = false;
+      createAccountCheckError = error.message;
+    }
+  }
+  let trustlineAffordable = false;
+  let trustlineCheckError = null;
+  if (xlmBalance != null && trustlineMinimum != null) {
+    try {
+      trustlineAffordable = remainsAboveMinimum(
+        xlmBalance,
+        "0",
+        TRANSACTION_FEE_STROOPS,
+        trustlineMinimum
+      );
+    } catch (error) {
+      trustlineCheckError = error.message;
+    }
+  }
 
   const loadLabInfo = async () => {
     setLoading("lab");
     setLabError(null);
     try {
       const [health, network] = await Promise.all([fetchHealth(), fetchNetworkInfo()]);
-      const info = { health, network };
-      setLabInfo(info);
-      return info;
+      setLabInfo({ health, network });
+      // Use the freshly fetched id rather than stale state from this render.
+      await readLabState(sessionContractId || network.contract?.kitewell);
     } catch (e) {
       setLabInfo(null);
       setLabError(
@@ -1279,13 +1600,49 @@ export default function App() {
     }
   };
 
-  const refreshLabState = useCallback(async (explicitContractId) => {
-    const contractId = explicitContractId ?? labInfo?.network?.contract?.kitewell;
+  const checkRpc = useCallback(async () => {
+    setRpcHealth((prev) => ({ ...prev, description: "checking" }));
+    try {
+      const result = await checkSorobanRpcHealth();
+      setRpcHealth(result);
+    } catch (error) {
+      setRpcHealth((prev) => ({
+        ...prev,
+        ok: false,
+        description: "unreachable",
+        latestLedger: null,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }, []);
+
+  // Recheck whenever the user switches networks: the new Horizon/Soroban RPC
+  // may be up while the old one is down.
+  useEffect(() => {
+    checkRpc();
+  }, [checkRpc, networkId]);
+
+  const refreshLabState = useCallback(async () => {
+    const contractId = labInfo?.network?.contract?.kitewell;
     if (!contractId) {
       setLabState(null);
       setLabStateError(null);
       return;
     }
+
+    // The Soroban RPC must be reachable before the Lab tab simulates or
+    // deploys anything. The backend's Horizon requests are intentionally
+    // unaffected: classic payments only need the Horizon server, not the RPC.
+    if (!rpcHealth.ok) {
+      setLabState(null);
+      setLabStateError(
+        rpcHealth.error ||
+          `Soroban RPC unreachable (${rpcHealth.description}). ` +
+          "Switch networks and refresh to recheck."
+      );
+      return;
+    }
+
     setLoading("labstate");
     setLabStateError(null);
     try {
@@ -1299,11 +1656,17 @@ export default function App() {
     } finally {
       setLoading("");
     }
-  }, [labInfo, publicKey]);
+  }, [labInfo, publicKey, rpcHealth]);
 
   const handleRegister = async (e) => {
     e.preventDefault();
     if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!rpcHealth.ok) {
+      return showToast(
+        "Soroban RPC unreachable — the contract cannot be invoked until it recovers.",
+        "error"
+      );
+    }
     const contractId = labInfo?.network?.contract?.kitewell;
     if (!contractId) {
       return showToast(
@@ -1321,18 +1684,28 @@ export default function App() {
       registerForm.name.trim(),
     ]);
     if (
-      simulationFees?.error ||
+      !simulationFees ||
+      simulationFees.error ||
       simulatedRegisterKey !== expectedSimulationKey
     ) {
       return showToast("Simulate this registration successfully before signing.", "error");
     }
+    const gate = submitGuardRef.current.begin(
+      "register",
+      `${contractId}|${registerForm.name.trim()}`
+    );
+    if (!gate.allowed) return;
+
     setLoading("register");
+    setTransactionFailure(null);
     try {
       const result = await registerBuilderWithFreighter(
         publicKey,
         contractId,
-        registerForm.name
+        registerForm.name,
+        labInfo?.network?.passphrase
       );
+      trackSubmission(result.hash, "register");
       setLastRegisterTx(result);
       setRegisterForm({ name: "" });
       setSimulationFees(null);
@@ -1350,6 +1723,7 @@ export default function App() {
       trackFailedSubmit("register", err);
       showToast(err.message || "Contract invoke failed.", "error");
     } finally {
+      submitGuardRef.current.end("register");
       setLoading("");
     }
   };
@@ -1586,66 +1960,220 @@ export default function App() {
     }
   };
 
-  const handleDecodeEnvelope = (event) => {
-    event.preventDefault();
-    setDecodeError(null);
-    setDecodedEnvelope(null);
+  const copyContractId = async (contractId) => {
+    const result = await copyToClipboardResult(contractId);
+    showToast(
+      result.ok ? "Contract id copied." : "Could not copy — select the id manually.",
+      result.ok ? "success" : "error"
+    );
+  };
+
+  const handleDeploy = async () => {
+    if (activeNetwork.id !== "TESTNET") {
+      return showToast("Contract deploy is Testnet-only.", "error");
+    }
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!wasmFile) return showToast("Choose the built kitewell.wasm first.", "error");
+
+    // A second deploy needs an explicit confirmation; the first id stays listed.
+    if (sessionContractId && !confirmRedeploy) {
+      setConfirmRedeploy(true);
+      return;
+    }
+
+    setDeployError(null);
+    setLoading("deploy");
     try {
-      setDecodedEnvelope(decodeEnvelope(envelopeXdr, activeNetwork.passphrase));
-    } catch (error) {
-      setDecodedEnvelope(null);
-      setDecodeError(error.message || "Could not decode the envelope.");
+      const wasmBytes = await wasmFile.arrayBuffer();
+      const result = await deployKitewellContract(publicKey, wasmBytes);
+      setSessionContractId(result.contractId);
+      setDeployedContracts((previous) => [...previous, result]);
+      setConfirmRedeploy(false);
+      await readLabState(result.contractId);
+      const copied = await copyToClipboardResult(result.contractId);
+      showToast(
+        copied.ok
+          ? `Deployed · ${result.contractId.slice(0, 8)}… copied.`
+          : `Deployed · ${result.contractId.slice(0, 8)}…`,
+        "success"
+      );
+    } catch (err) {
+      setDeployError({
+        message: err.message || "Contract deploy failed.",
+        // An init failure still has an installed contract; a failed install does not.
+        contractId: err.contractId || null,
+      });
+      showToast("Contract deploy failed.", "error");
+    } finally {
+      setLoading("");
     }
   };
 
-  const handleBuildMuxed = (event) => {
+  const handleComposeAdd = (event) => {
     event.preventDefault();
-    setMuxedError(null);
-    setMuxedBuildResult(null);
-    try {
-      setMuxedBuildResult(
-        buildMuxedAddress(
-          muxedBuildForm.gAddress.trim(),
-          muxedBuildForm.id.trim()
-        )
+    if (composeOps.length >= MAX_COMPOSED_OPERATIONS) {
+      return showToast(
+        `A transaction can contain at most ${MAX_COMPOSED_OPERATIONS} operations.`,
+        "error"
       );
+    }
+
+    const entry = { type: composeForm.type };
+    if (composeForm.type === "payment") {
+      const selected = balances.find((b) => b.key === composeForm.assetKey);
+      entry.destination = composeForm.destination.trim();
+      entry.amount = composeForm.amount;
+      entry.asset =
+        selected && !selected.isNative
+          ? { isNative: false, code: selected.code, issuer: selected.issuer }
+          : { isNative: true };
+    } else if (composeForm.type === "changeTrust") {
+      entry.code = composeForm.code.trim();
+      entry.issuer = composeForm.issuer.trim();
+      entry.limit = composeForm.limit;
+    } else {
+      entry.name = composeForm.name.trim();
+      entry.value = composeForm.value;
+    }
+
+    try {
+      buildComposedOperation(entry);
     } catch (err) {
-      setMuxedError(err.message || "Could not build the muxed address.");
+      return showToast(err.message, "error");
+    }
+
+    composeId.current += 1;
+    setComposeOps((previous) => [...previous, { ...entry, id: composeId.current }]);
+    setComposeForm((previous) => ({
+      ...previous,
+      destination: "",
+      amount: "",
+      code: "",
+      issuer: "",
+      limit: "1000000",
+      name: "",
+      value: "",
+    }));
+    setComposeResult(null);
+    setComposeError(null);
+  };
+
+  const moveComposeOperation = (index, offset) => {
+    setComposeOps((previous) => {
+      const target = index + offset;
+      if (target < 0 || target >= previous.length) return previous;
+      const next = [...previous];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+    setComposeResult(null);
+    setComposeError(null);
+  };
+
+  const removeComposeOperation = (index) => {
+    setComposeOps((previous) => previous.filter((_, i) => i !== index));
+    setComposeResult(null);
+    setComposeError(null);
+  };
+
+  const handleComposeSubmit = async () => {
+    if (composeOps.length === 0) {
+      setComposeError("Add at least one operation before signing.");
+      return;
+    }
+    if (!publicKey) {
+      return showToast("Connect Freighter first.", "error");
+    }
+
+    setLoading("compose");
+    setComposeError(null);
+    setComposeResult(null);
+    try {
+      const result = await submitComposedOperations(publicKey, composeOps);
+      setComposeResult({
+        hash: result.hash,
+        explorerUrl: explorerTxUrl(result.hash),
+      });
+      setComposeOps([]);
+      showToast(`Composed transaction submitted · ${result.hash.slice(0, 12)}…`);
+      try {
+        const next = await getAccountBalances(publicKey);
+        setBalances(next);
+      } catch {
+        /* balance refresh is best-effort */
+      }
+    } catch (err) {
+      setComposeError(err.message || "Composed transaction failed.");
+      showToast(err.message || "Composed transaction failed.", "error");
+    } finally {
+      setLoading("");
     }
   };
 
-  const handleSplitMuxed = (event) => {
-    event.preventDefault();
-    setMuxedError(null);
-    setMuxedSplitResult(null);
+  const loadFeeStats = async () => {
+    setLoading("feestats");
+    setFeeStatsError(null);
+    setFeeStats(null);
     try {
-      const { gAddress, id } = splitMuxedAddress(
-        muxedSplitForm.mAddress.trim()
-      );
-      setMuxedSplitResult({ gAddress, id: id.toString() });
+      setFeeStats(await getFeeStats());
+    } catch {
+      setFeeStatsError("Fee stats could not be loaded.");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const applyFeePreset = (source) => {
+    const stroops = feeStats?.[source];
+    if (!stroops) {
+      return showToast("Load fee stats before choosing a percentile.", "error");
+    }
+
+    try {
+      setFeeSetting(saveFeeSetting({ source, stroops }));
+      showToast(`Fee set to ${stroops} stroops per operation.`);
     } catch (err) {
-      setMuxedError(err.message || "Could not split the muxed address.");
+      showToast(err.message || "Could not save the fee.", "error");
+    }
+  };
+
+  const handleCustomFee = (event) => {
+    event.preventDefault();
+    try {
+      const saved = saveFeeSetting({ source: "custom", stroops: customFee });
+      setFeeSetting(saved);
+      showToast(`Fee set to ${saved.stroops} stroops per operation.`);
+    } catch (err) {
+      showToast(err.message || "Could not save the fee.", "error");
     }
   };
 
   const activateTab = (tab) => {
     setActiveTab(tab);
+    if (tab === "Fees") loadFeeStats();
     if (tab === "History") handleHistory();
     if (tab === "Lab") {
-      loadLabInfo().then((info) => {
-        const contractId = info?.network?.contract?.kitewell;
-        refreshLabState(contractId);
-        refreshTtlInfo(contractId);
-      });
+      loadLabInfo();
+      checkRpc();
+      refreshLabState();
     }
-    if (tab === "Issuer") refreshIssuerPanel();
-    if ((tab === "Wallet" || tab === "Assets" || tab === "Send") && publicKey) {
+    if (tab === "Assets") {
+      if (publicKey) refreshBalances();
+      else refreshReserve();
+    } else if ((tab === "Wallet" || tab === "Send") && publicKey) {
       refreshBalances();
     }
+    if (tab === "Assets") refreshClawbackAssets();
   };
 
   const handleSimulateRegister = async () => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!rpcHealth.ok) {
+      return showToast(
+        "Soroban RPC unreachable — the contract cannot be simulated until it recovers.",
+        "error"
+      );
+    }
     const contractId = labInfo?.network?.contract?.kitewell;
     if (!contractId) {
       return showToast(
@@ -1704,76 +2232,31 @@ export default function App() {
     tabRefs.current[nextIndex]?.focus();
   };
 
-  // Issue #513: one element reused by every tab that submits, because only one
-  // watch runs at a time and it must be visible right where the hash appeared.
-  const txWatchPanel = (
-    <div className="section">
-      <h2>Transaction status</h2>
-      <p className="muted">
-        A transaction submitted here is followed until it reaches the ledger, fails, or passes
-        its max time.
-      </p>
+  useEffect(() => {
+    const destination = sendForm.destination.trim();
+    if (!destination || !destination.includes("*")) {
+      setResolvedFederation(null);
+      return;
+    }
 
-      {txWatch && (
-        <div
-          className={
-            txWatch.status === "failed" || txWatch.status === "expired"
-              ? "info-box info-box--warning"
-              : "info-box"
-          }
-          role="status"
-          aria-live="polite"
-        >
-          <span className="eyebrow">
-            <code>{txWatch.hash}</code> · {txWatch.status}
-          </span>
-          <p className="muted">{txWatch.text}</p>
-          <a
-            className="text-link"
-            href={txWatch.explorerUrl}
-            target="_blank"
-            rel="noreferrer"
-            style={{ marginTop: 6, display: "inline-block" }}
-          >
-            Explorer ↗
-          </a>
-        </div>
-      )}
-      {txWatchError && (
-        <div className="info-box info-box--warning">
-          <span className="eyebrow">Transaction watch</span>
-          <p className="muted">{txWatchError}</p>
-        </div>
-      )}
+    let cancelled = false;
+    setLoading("resolve");
+    setResolvedFederation(null);
+    resolveFederationAddress(destination)
+      .then((account) => {
+        if (!cancelled) setResolvedFederation(account);
+      })
+      .catch((err) => {
+        if (!cancelled) showToast(err.message || "Federation lookup failed.", "error");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading("");
+      });
 
-      <form className="form" onSubmit={handleWatchHash}>
-        <label className="label" htmlFor="watch-tx-hash">
-          Watch a transaction hash
-        </label>
-        <input
-          id="watch-tx-hash"
-          className="input"
-          type="text"
-          placeholder="64 hexadecimal characters"
-          maxLength={64}
-          value={hashForm}
-          onChange={(e) => setHashForm(e.target.value)}
-          aria-describedby="watch-tx-hash-help"
-          required
-        />
-        <p className="muted" id="watch-tx-hash-help" role={hashError ? "alert" : undefined}>
-          {hashError || "Paste any transaction hash from this network to follow it."}
-        </p>
-        <button
-          className="btn btn--primary"
-          type="submit"
-          disabled={loading === "issue"}
-        >
-          Watch status
-        </button>
-      </form>
-    </div>
-  );
+    return () => {
+      cancelled = true;
+    };
+  }, [sendForm.destination]);
 
   return (
     <div className="app">
@@ -1824,6 +2307,7 @@ export default function App() {
             ))}
           </select>
         </label>
+        <LatestLedgerHeader networkId={networkId} />
       </header>
 
       <main className="main">
@@ -1906,6 +2390,8 @@ export default function App() {
             </div>
           )}
         </section>
+
+        <TransactionFailureNotice failure={transactionFailure} />
 
         <nav className="tabs" aria-label="Lab sections" role="tablist">
           {TABS.map((t, index) => {
@@ -2169,6 +2655,101 @@ export default function App() {
                   "Request Friendbot XLM"
                 )}
               </button>
+              <form className="form" onSubmit={handleCreateAccount}>
+                <h3 className="subhead">Create account from this wallet</h3>
+                <p className="muted">
+                  Create a Stellar account by sending XLM from your connected
+                  account. This is separate from Friendbot funding.
+                </p>
+                <label className="label" htmlFor="create-account-destination">
+                  New account address
+                </label>
+                <input
+                  id="create-account-destination"
+                  className="input"
+                  value={createAccountForm.destination}
+                  onChange={(event) =>
+                    setCreateAccountForm({
+                      ...createAccountForm,
+                      destination: event.target.value,
+                    })
+                  }
+                  placeholder="G…"
+                  required
+                />
+                <label className="label" htmlFor="create-account-amount">
+                  Starting balance (XLM)
+                </label>
+                <input
+                  id="create-account-amount"
+                  className="input"
+                  type="number"
+                  min="0.0000001"
+                  step="0.0000001"
+                  value={createAccountForm.startingBalance}
+                  onChange={(event) =>
+                    setCreateAccountForm({
+                      ...createAccountForm,
+                      startingBalance: event.target.value,
+                    })
+                  }
+                  required
+                />
+                <div className="info-box" aria-live="polite">
+                  <span className="eyebrow">Source account reserve check</span>
+                  <span>Source balance: {xlmBalance ?? "—"} XLM</span>
+                  <span>
+                    Amount: {createAccountForm.startingBalance || "—"} XLM
+                  </span>
+                  <span>Transaction fee: {transactionFee} XLM</span>
+                  <span>
+                    Source minimum:{" "}
+                    {sourceMinimumStroops == null
+                      ? "—"
+                      : `${formatStroops(sourceMinimumStroops)} XLM`}
+                  </span>
+                  {baseReserveInStroops == null ? (
+                    <p className="muted">
+                      {reserveError ||
+                        "Load the latest ledger before checking account creation."}
+                    </p>
+                  ) : !accountDetails ? (
+                    <p className="muted">
+                      Connect and load the source account to check its minimum.
+                    </p>
+                  ) : createAccountCheckError ? (
+                    <p className="muted">{createAccountCheckError}</p>
+                  ) : !createAccountForm.startingBalance ? (
+                    <p className="muted">Enter a starting balance to run the check.</p>
+                  ) : (
+                    <strong>
+                      {createAccountAffordable && createAccountDestinationAffordable
+                        ? "Source remains above its minimum; starting balance covers the new account minimum."
+                        : "This amount does not satisfy the source or new-account minimum."}
+                    </strong>
+                  )}
+                </div>
+                <button
+                  className="btn btn--primary"
+                  type="submit"
+                  disabled={
+                    loading === "create-account" ||
+                    requireWallet ||
+                    !accountDetails ||
+                    baseReserveInStroops == null ||
+                    !createAccountAffordable ||
+                    !createAccountDestinationAffordable
+                  }
+                >
+                  {loading === "create-account" ? (
+                    <>
+                      <Spinner /> Creating…
+                    </>
+                  ) : (
+                    "Sign create-account"
+                  )}
+                </button>
+              </form>
             </div>
           )}
 
@@ -2246,6 +2827,40 @@ export default function App() {
                 View holdings, open a trustline, or remove an empty one with Freighter{" "}
                 <code>signTransaction</code>. Removing sets the limit to 0.
               </p>
+              <div className="info-box">
+                <span className="eyebrow">Minimum XLM calculator</span>
+                <label className="label" htmlFor="reserve-subentries">
+                  Subentry count
+                </label>
+                <input
+                  id="reserve-subentries"
+                  className="input"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={reserveSubentryCount}
+                  onChange={(event) =>
+                    setReserveSubentryCount(event.target.value)
+                  }
+                />
+                {baseReserveInStroops == null ? (
+                  <p className="muted">
+                    {reserveError ||
+                      "Connect a wallet and load the latest ledger to calculate the minimum."}
+                  </p>
+                ) : !/^\d+$/.test(reserveSubentryCount) ? (
+                  <p className="muted">
+                    Enter a non-negative whole number of subentries.
+                  </p>
+                ) : (
+                  <p className="muted">
+                    Base reserve from the latest Horizon ledger:{" "}
+                    {formatStroops(baseReserveInStroops)} XLM. Minimum balance:{" "}
+                    {calculateMinimumBalance(baseReserveInStroops, reserveSubentryCount)}{" "}
+                    XLM.
+                  </p>
+                )}
+              </div>
 
               {assetBalances.length > 0 ? (
                 <ul className="balance-list">
@@ -2258,13 +2873,14 @@ export default function App() {
                             {shortenAddress(b.issuer)}
                           </span>
                         )}
-                        {!b.isNative && (
-                          <div className="muted balance-row__flags">
-                            Authorization: {b.isAuthorized === true ? "Authorized" : b.isAuthorized === false ? "Unauthorized" : "Unknown"}
-                            {" · "}Liabilities: {b.isAuthorizedToMaintainLiabilities === true ? "Authorized" : b.isAuthorizedToMaintainLiabilities === false ? "Unauthorized" : "Unknown"}
-                            {" · "}Clawback: {b.clawbackEnabled === true ? "Enabled" : b.clawbackEnabled === false ? "Disabled" : "Unknown"}
-                          </div>
-                        )}
+                        <div className="balance-row__liabilities">
+                          <span className="liability selling" title="Selling liabilities (offers selling this asset)">
+                            ▼ {parseFloat(b.sellingLiabilities || "0").toLocaleString(undefined, { maximumFractionDigits: 7 })}
+                          </span>
+                          <span className="liability buying" title="Buying liabilities (offers buying this asset)">
+                            ▲ {parseFloat(b.buyingLiabilities || "0").toLocaleString(undefined, { maximumFractionDigits: 7 })}
+                          </span>
+                        </div>
                       </div>
                       <div className="balance-row__actions">
                         <span>
@@ -2449,10 +3065,53 @@ export default function App() {
                   value={trustForm.limit}
                   onChange={(e) => setTrustForm({ ...trustForm, limit: e.target.value })}
                 />
+                <div className="info-box" aria-live="polite">
+                  <span className="eyebrow">Trustline reserve check</span>
+                  {baseReserveInStroops == null ? (
+                    <p className="muted">
+                      {reserveError ||
+                        "Load the latest ledger before checking this trustline."}
+                    </p>
+                  ) : !accountDetails || trustlineMinimum == null ? (
+                    <p className="muted">
+                      Connect and load the source account, including its subentry count, to check its reserve.
+                    </p>
+                  ) : trustlineCheckError ? (
+                    <p className="muted">{trustlineCheckError}</p>
+                  ) : (
+                    <>
+                      <span>
+                        Extra reserve:{" "}
+                        {trustlineAlreadyExists
+                          ? "0.0000000"
+                          : formatStroops(baseReserveInStroops)}{" "}
+                        XLM
+                      </span>
+                      <span>
+                        Required after trustline and fee:{" "}
+                        {formatStroops(
+                          trustlineMinimum + BigInt(TRANSACTION_FEE_STROOPS)
+                        )}{" "}
+                        XLM
+                      </span>
+                      <strong>
+                        {trustlineAffordable
+                          ? "Source can cover the reserve and fee."
+                          : "Source balance is below the required reserve and fee."}
+                      </strong>
+                    </>
+                  )}
+                </div>
                 <button
                   className="btn btn--primary"
                   type="submit"
-                  disabled={loading === "trust" || requireWallet}
+                  disabled={
+                    loading === "trust" ||
+                    requireWallet ||
+                    !accountDetails ||
+                    baseReserveInStroops == null ||
+                    !trustlineAffordable
+                  }
                 >
                   {loading === "trust" ? (
                     <>
@@ -2750,16 +3409,18 @@ export default function App() {
                 >
                   <option value="native">XLM (native)</option>
                   {balances
-                    .filter((b) => !b.isNative && !b.isPoolShare)
-                    .map((b) => (
-                      <option key={b.key} value={b.key} disabled={b.isAuthorized === false}>
-                        {b.code} ·{" "}
-                        {parseFloat(b.balance).toLocaleString(undefined, {
-                          maximumFractionDigits: 4,
-                        })}
-                        {b.isAuthorized === false ? " · unauthorized (cannot send)" : ""}
-                      </option>
-                    ))}
+                    .filter((b) => !b.isNative)
+                    .map((b) => {
+                      const available = parseFloat(b.balance) - parseFloat(b.sellingLiabilities || "0");
+                      return (
+                        <option key={b.key} value={b.key}>
+                          {b.code} ·{" "}
+                          {available.toLocaleString(undefined, {
+                            maximumFractionDigits: 4,
+                          })}
+                        </option>
+                      );
+                    })}
                 </select>
                 {selectedSendAsset?.isAuthorized === false && (
                   <p className="muted" role="alert">
@@ -2767,7 +3428,7 @@ export default function App() {
                   </p>
                 )}
                 <label className="label" htmlFor="send-amount">
-                  Amount ({selectedSendAsset?.code ?? "XLM"})
+                  Amount ({selectedSendAsset?.code ?? "XLM"}){selectedSendAssetAvailable !== null ? ` · Available: ${selectedSendAssetAvailable.toFixed(7)}` : ""}
                 </label>
                 <input
                   id="send-amount"
@@ -2809,63 +3470,50 @@ export default function App() {
                   value={sendForm.memo}
                   onChange={(e) => updateSendForm({ memo: e.target.value })}
                 />
-                {unsignedEnvelope && (
-                  <div className="info-box">
-                    <span className="eyebrow">Unsigned envelope XDR</span>
-                    <code style={{ wordBreak: "break-all" }}>
-                      {unsignedEnvelope}
-                    </code>
-                    <p className="muted">
-                      Copy this envelope to hand it to another signer or the decoder.
-                      Copying does not sign or submit it.
-                    </p>
-                    <button
-                      className="btn btn--secondary btn--sm"
-                      type="button"
-                      onClick={() => {
-                        navigator.clipboard.writeText(unsignedEnvelope);
-                        showToast(
-                          "Unsigned envelope copied. Nothing was signed or submitted.",
-                          "info"
-                        );
-                      }}
-                    >
-                      Copy XDR
-                    </button>
-                  </div>
-                )}
-                <div className="section__row">
-                  <button
-                    className="btn btn--secondary"
-                    type="button"
-                    onClick={handlePreviewEnvelope}
-                    disabled={loading === "preview" || requireWallet}
-                  >
-                    {loading === "preview" ? (
-                      <>
-                        <Spinner /> Building…
-                      </>
-                    ) : (
-                      "Build unsigned envelope"
-                    )}
-                  </button>
-                  <button
-                    className="btn btn--primary"
-                    type="submit"
-                    disabled={loading === "send" || loading === "preview" || requireWallet}
-                  >
-                    {loading === "send" ? (
-                      <>
-                        <Spinner /> Signing in Freighter…
-                      </>
-                    ) : (
-                      "Sign & send"
-                    )}
-                  </button>
-                </div>
+                <label className="label" htmlFor="send-min-time">
+                  Min time (UTC, optional)
+                </label>
+                <input
+                  id="send-min-time"
+                  className="input"
+                  type="datetime-local"
+                  value={sendForm.minTime}
+                  onChange={(e) => setSendForm({ ...sendForm, minTime: e.target.value })}
+                />
+                <label className="label" htmlFor="send-max-time">
+                  Max time (UTC, optional)
+                </label>
+                <input
+                  id="send-max-time"
+                  className="input"
+                  type="datetime-local"
+                  value={sendForm.maxTime}
+                  onChange={(e) => setSendForm({ ...sendForm, maxTime: e.target.value })}
+                />
+                <button
+                  className="btn btn--primary"
+                  type="submit"
+                  disabled={loading === "send" || requireWallet}
+                >
+                  {loading === "send" ? (
+                    <>
+                      <Spinner /> Signing in Freighter…
+                    </>
+                  ) : (
+                    "Sign & send"
+                  )}
+                </button>
               </form>
 
-              {txWatchPanel}
+              {resolvedFederation && (
+                <div className="info-box">
+                  <span className="eyebrow">Resolved federation address</span>
+                  <code>{resolvedFederation}</code>
+                  <p className="muted" style={{ marginTop: 4 }}>
+                    Destination account resolved before signing.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
@@ -3018,6 +3666,65 @@ export default function App() {
                   Leave empty to route through the direct order book. Intermediate hops add a
                   fixed path to the operation.
                 </p>
+
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={handlePathQuote}
+                  disabled={loading === "pathquote"}
+                >
+                  {loading === "pathquote" ? (
+                    <>
+                      <Spinner /> Asking Horizon…
+                    </>
+                  ) : (
+                    "Get a Horizon path quote"
+                  )}
+                </button>
+
+                {pathQuote && (
+                  <div className="info-box">
+                    <span className="eyebrow">Horizon paths</span>
+                    {pathQuote.error ? (
+                      <p className="muted">{pathQuote.error}</p>
+                    ) : (
+                      <div className="tx-list">
+                        {pathQuote.paths.map((quote, index) => {
+                          const hops = formatPathHops(quote.path);
+                          const destLabel =
+                            pathForm.destAssetType === "native"
+                              ? "XLM"
+                              : pathForm.destCode;
+                          const sendLabel =
+                            pathForm.sendAssetType === "native"
+                              ? "XLM"
+                              : pathForm.sendCode;
+                          const estimate =
+                            pathForm.mode === "strictSend"
+                              ? `${quote.destinationAmount} ${destLabel} received`
+                              : `${quote.sourceAmount} ${sendLabel} spent`;
+                          return (
+                            <div key={`${hops}-${index}`} className="tx-item">
+                              <div className="tx-item__amount">
+                                {hops || "Direct path"}
+                              </div>
+                              <div className="tx-item__addr muted">
+                                {estimate}
+                              </div>
+                              <button
+                                className="btn btn--secondary"
+                                type="button"
+                                onClick={() => handleUsePath(quote.path)}
+                              >
+                                Use this path
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 <button
                   className="btn btn--primary"
@@ -3329,6 +4036,102 @@ export default function App() {
             </div>
           )}
 
+          {activeTab === "Fees" && (
+            <div className="section">
+              <div className="section__row">
+                <h2>Network fee</h2>
+                <button
+                  className="btn btn--secondary"
+                  type="button"
+                  onClick={loadFeeStats}
+                  disabled={loading === "feestats"}
+                >
+                  {loading === "feestats" ? (
+                    <>
+                      <Spinner /> Loading…
+                    </>
+                  ) : (
+                    "Refresh stats"
+                  )}
+                </button>
+              </div>
+              <p className="muted">
+                Horizon reports the fees charged in the last ledger. Pick one of its
+                percentiles or type your own; the next payment, trustline, or path
+                payment uses that fee per operation.
+              </p>
+
+              <div className="info-box">
+                <span className="eyebrow">Current fee</span>
+                <code>
+                  {feeSetting
+                    ? `${feeSetting.stroops} stroops per operation`
+                    : "SDK default (100 stroops per operation)"}
+                </code>
+                {feeSetting && (
+                  <p className="muted" style={{ marginTop: 6 }}>
+                    Source:{" "}
+                    {feeSetting.source === "custom"
+                      ? "custom"
+                      : `Horizon ${feeSetting.source}`}
+                  </p>
+                )}
+              </div>
+
+              {feeStatsError && (
+                <div className="info-box info-box--warning" role="alert">
+                  <span className="eyebrow">Fee stats</span>
+                  <p className="muted">{feeStatsError}</p>
+                </div>
+              )}
+
+              {feeStats && (
+                <div className="info-box">
+                  <span className="eyebrow">
+                    Last ledger
+                    {feeStats.lastLedger ? ` · ${feeStats.lastLedger}` : ""}
+                  </span>
+                  <div className="metadata-grid">
+                    {FEE_PERCENTILES.map(({ key, label }) => (
+                      <div key={key}>
+                        <span className="metadata-label">{label}</span>
+                        <span className="metadata-value">
+                          {feeStats[key]} stroops
+                        </span>
+                        <button
+                          className="btn btn--secondary"
+                          type="button"
+                          onClick={() => applyFeePreset(key)}
+                        >
+                          Use {label}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <form className="form" onSubmit={handleCustomFee}>
+                <label className="label" htmlFor="custom-fee">
+                  Custom fee (stroops per operation)
+                </label>
+                <input
+                  id="custom-fee"
+                  className="input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="e.g. 500"
+                  value={customFee}
+                  onChange={(e) => setCustomFee(e.target.value)}
+                />
+                <button className="btn btn--secondary" type="submit">
+                  Use custom fee
+                </button>
+              </form>
+            </div>
+          )}
+
           {activeTab === "Lab" && (
             <div className="section">
               <div className="section__row">
@@ -3374,20 +4177,163 @@ export default function App() {
                   <div className="info-box">
                     <span className="eyebrow">Soroban · kitewell</span>
                     <code>
-                      {labInfo.network.contract?.kitewell ||
-                        "Not deployed yet — see contracts/README.md"}
+                      {activeContractId ||
+                        "Not deployed yet — deploy below or see contracts/README.md"}
                     </code>
                     <p className="muted" style={{ marginTop: 6 }}>
-                      Status: {labInfo.network.contract?.status}
+                      Status:{" "}
+                      {sessionContractId
+                        ? "deployed this session"
+                        : labInfo.network.contract?.status}
                     </p>
                   </div>
+                  {!configuredContractId && (
+                    <div className="info-box">
+                      <span className="eyebrow">Deploy from Wasm</span>
+                      <p className="muted">
+                        No contract id is configured on the backend. Install the registry
+                        Wasm, then run <code>init</code> with your connected account as
+                        admin.
+                      </p>
+                      <label className="label" htmlFor="kitewell-wasm">
+                        kitewell.wasm
+                      </label>
+                      <input
+                        id="kitewell-wasm"
+                        className="input"
+                        type="file"
+                        accept=".wasm,application/wasm"
+                        onChange={(e) => {
+                          setWasmFile(e.target.files?.[0] ?? null);
+                          setConfirmRedeploy(false);
+                          setDeployError(null);
+                        }}
+                      />
+                      <p className="muted">
+                        Build with <code>npm run build:contracts</code> (output:{" "}
+                        <code>contracts/target/wasm32v1-none/release/kitewell.wasm</code>).
+                      </p>
+                      {!confirmRedeploy && (
+                        <button
+                          className="btn btn--secondary"
+                          type="button"
+                          onClick={handleDeploy}
+                          disabled={
+                            loading === "deploy" || requireWallet || !wasmFile
+                          }
+                        >
+                          {loading === "deploy" ? (
+                            <>
+                              <Spinner /> Installing &amp; initialising…
+                            </>
+                          ) : sessionContractId ? (
+                            "Deploy another…"
+                          ) : (
+                            "Install & init"
+                          )}
+                        </button>
+                      )}
+                      {!publicKey && (
+                        <p className="muted">
+                          Connect Freighter to sign the install and init transactions.
+                        </p>
+                      )}
+                      {sessionContractId && !confirmRedeploy && (
+                        <p className="muted">
+                          First id stays visible below; deploying again creates a new one
+                          and asks for confirmation first.
+                        </p>
+                      )}
+                      {confirmRedeploy && (
+                        <div className="info-box info-box--warning" style={{ marginTop: 8 }}>
+                          <span className="eyebrow">Confirm re-deploy</span>
+                          <p className="muted">
+                            A contract was already deployed this session:{" "}
+                            <code>{sessionContractId}</code>. A new deploy creates another
+                            id; the first stays listed below.
+                          </p>
+                          <div className="section__row">
+                            <button
+                              className="btn btn--secondary"
+                              type="button"
+                              onClick={() => setConfirmRedeploy(false)}
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              className="btn btn--primary"
+                              type="button"
+                              onClick={handleDeploy}
+                              disabled={loading === "deploy" || !wasmFile}
+                            >
+                              {loading === "deploy" ? (
+                                <>
+                                  <Spinner /> Deploying…
+                                </>
+                              ) : (
+                                "Confirm deploy"
+                              )}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {deployError && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">Deploy failed</span>
+                      <p className="muted">{deployError.message}</p>
+                      {deployError.contractId && (
+                        <p className="muted">
+                          Install succeeded with id <code>{deployError.contractId}</code>,
+                          but <code>init</code> did not complete.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  {sessionContractId && (
+                    <div className="info-box">
+                      <span className="eyebrow">Deployed this session</span>
+                      <code>{sessionContractId}</code>
+                      <div className="section__row">
+                        <button
+                          className="btn btn--secondary btn--sm"
+                          type="button"
+                          onClick={() => copyContractId(sessionContractId)}
+                        >
+                          Copy id
+                        </button>
+                        <span className="muted">Active for Lab reads &amp; register</span>
+                      </div>
+                      <p className="muted">
+                        Set{" "}
+                        <code>KITEWELL_CONTRACT_ID={sessionContractId}</code> on the
+                        backend to persist it. This panel does not write backend env vars.
+                      </p>
+                      {deployedContracts.length > 1 && (
+                        <div className="metadata-grid">
+                          {deployedContracts.map((entry, index) => (
+                            <div key={`${entry.contractId}-${index}`}>
+                              <span className="metadata-label">
+                                Deploy #{index + 1}
+                                {entry.contractId === sessionContractId
+                                  ? " · active"
+                                  : ""}
+                              </span>
+                              <code>{entry.contractId}</code>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
                   <div className="section__row">
                     <div className="subhead">On-chain registry</div>
                     <button
                       className="btn btn--secondary"
                       type="button"
                       onClick={refreshLabState}
-                      disabled={loading === "labstate"}
+                      disabled={loading === "labstate" || !rpcHealth.ok}
                     >
                       {loading === "labstate" ? (
                         <>
@@ -3416,6 +4362,18 @@ export default function App() {
                             {publicKey ? labState.builder ?? "Not registered" : "Connect to check"}
                           </span>
                         </div>
+                        <div>
+                          <span className="metadata-label">paused</span>
+                          <span className="metadata-value">
+                            {labState.paused ? "Yes — registration paused" : "No"}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">get_admin</span>
+                          <span className="metadata-value">
+                            {labState.admin ? shortenAddress(labState.admin) : "Not set"}
+                          </span>
+                        </div>
                       </div>
                     </div>
                   ) : (
@@ -3425,8 +4383,69 @@ export default function App() {
                   )}
                   {labStateError && (
                     <div className="info-box info-box--warning">
-                      <span className="eyebrow">Soroban RPC</span>
+                      <span className="eyebrow">Contract state</span>
                       <p className="muted">{labStateError}</p>
+                    </div>
+                  )}
+                  {labState?.paused && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">Registration paused</span>
+                      <p className="muted">
+                        The admin paused check-ins. Registering now is rejected by the
+                        contract with a paused error; unpause to resume.
+                      </p>
+                    </div>
+                  )}
+                  <div className="section__row">
+                    <div className="subhead">Contract controls</div>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={handleTogglePause}
+                      disabled={loading === "pause" || requireWallet}
+                    >
+                      {loading === "pause" ? (
+                        <>
+                          <Spinner /> Signing in Freighter…
+                        </>
+                      ) : labState?.paused ? (
+                        "Unpause registration"
+                      ) : (
+                        "Pause registration"
+                      )}
+                    </button>
+                    {publicKey && labState?.builder && (
+                      <button
+                        className="btn btn--secondary"
+                        type="button"
+                        onClick={handleUnregister}
+                        disabled={loading === "unregister"}
+                      >
+                        {loading === "unregister" ? (
+                          <>
+                            <Spinner /> Signing in Freighter…
+                          </>
+                        ) : (
+                          "Unregister me"
+                        )}
+                      </button>
+                    )}
+                  </div>
+                  {!publicKey && (
+                    <p className="muted">Connect Freighter to pause or unregister.</p>
+                  )}
+                  {lastLabTx && (
+                    <div className="info-box">
+                      <span className="eyebrow">Last contract tx</span>
+                      <code>{lastLabTx.hash}</code>
+                      <a
+                        href={explorerTxUrl(lastLabTx.hash)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-link"
+                      >
+                        Explorer ↗
+                      </a>
                     </div>
                   )}
                   <form className="form" onSubmit={handleRegister}>
@@ -3452,6 +4471,7 @@ export default function App() {
                         loading === "register" ||
                         loading === "simulate" ||
                         requireWallet ||
+                        !rpcHealth.ok ||
                         !registerSimulationReady
                       }
                     >
@@ -3470,7 +4490,8 @@ export default function App() {
                       disabled={
                         loading === "simulate" ||
                         loading === "register" ||
-                        requireWallet
+                        requireWallet ||
+                        !rpcHealth.ok
                       }
                     >
                       {loading === "simulate" ? (
@@ -4568,6 +5589,24 @@ function streamStatusLabel(state) {
     return STREAM_CLOSED_LINES[state.reason] ?? "Payments stream closed.";
   }
   return "Payments stream not running.";
+}
+
+function describeComposeOperation(operation) {
+  if (operation.type === "payment") {
+    const asset = operation.asset?.isNative
+      ? "XLM"
+      : `${operation.asset?.code}:${shortenAddress(operation.asset?.issuer)}`;
+    return `Payment · ${operation.amount} ${asset} to ${shortenAddress(
+      operation.destination
+    )}`;
+  }
+
+  if (operation.type === "changeTrust") {
+    return `Change trust · ${operation.code} · limit ${operation.limit}`;
+  }
+
+  const value = operation.value ? ` = ${operation.value}` : " (delete)";
+  return `Manage data · ${operation.name}${value}`;
 }
 
 function formatCreatedAt(value) {

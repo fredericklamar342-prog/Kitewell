@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * CI-friendly tests for the Soroban helpers in ./freighter.
@@ -9,25 +9,25 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * - The real SDK is used for tx building, XDR round-trips, and scVal decoding.
  */
 
-const { sorobanServerMock, signTransactionMock, horizonServerMock } = vi.hoisted(() => ({
-  sorobanServerMock: {
-    simulateTransaction: vi.fn(),
-    prepareTransaction: vi.fn(),
-    sendTransaction: vi.fn(),
-    getTransaction: vi.fn(),
-    getAccount: vi.fn(),
-  },
-  signTransactionMock: vi.fn(),
-  horizonServerMock: {
-    loadAccount: vi.fn(),
-    submitTransaction: vi.fn(),
-  },
-}));
+const { sorobanServerMock, signTransactionMock, getNetworkDetailsMock } = vi.hoisted(
+  () => ({
+    sorobanServerMock: {
+      simulateTransaction: vi.fn(),
+      prepareTransaction: vi.fn(),
+      sendTransaction: vi.fn(),
+      getTransaction: vi.fn(),
+      getAccount: vi.fn(),
+    },
+    signTransactionMock: vi.fn(),
+    getNetworkDetailsMock: vi.fn(),
+  })
+);
 
 vi.mock("@stellar/freighter-api", () => ({
   isConnected: vi.fn(),
   setAllowed: vi.fn(),
   getAddress: vi.fn(),
+  getNetworkDetails: getNetworkDetailsMock,
   getNetwork: vi.fn(async () => {
     const { getActiveNetwork } = await import("./network");
     const active = getActiveNetwork();
@@ -60,12 +60,40 @@ const {
   SOROBAN_RPC_URL,
   readKitewellState,
   registerBuilderWithFreighter,
-  clawbackClaimableBalanceWithFreighter,
+  setPausedWithFreighter,
+  unregisterBuilderWithFreighter,
 } = await import("./freighter");
 
 const CONTRACT_ID =
   "CCWLNS5HECRJ2GM3Q6JZZDV334ZXYO6EKZLFPLQRXO6SUDAKMS4U3E3X";
 const USER = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+const DEST = StellarSdk.Keypair.random().publicKey();
+const AMOUNT = "10.0000000";
+
+// Build a valid signed transaction XDR for mocking
+let signedTxXdr;
+beforeAll(() => {
+  const account = new StellarSdk.Account(USER, "123456");
+  const tx = new StellarSdk.TransactionBuilder(account, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: StellarSdk.Networks.TESTNET,
+  })
+    .addOperation(
+      StellarSdk.Operation.payment({
+        destination: DEST,
+        asset: StellarSdk.Asset.native(),
+        amount: AMOUNT,
+      })
+    )
+    .setTimeout(180)
+    .build();
+  // Sign with a dummy keypair to get valid XDR
+  const keypair = StellarSdk.Keypair.fromSecret(
+    "SBP4BHQPSIWSFMYZUE5RZ7AXZBKTUY76HNISQ7GZYD7U7JKGJBMRQR52"
+  );
+  tx.sign(keypair);
+  signedTxXdr = tx.toXDR();
+});
 
 /** Build the same tx shape the helpers build, for XDR round-trip asserts. */
 function buildRegisterTx(caller, name, sequence = "7") {
@@ -98,10 +126,54 @@ function simOk(retval) {
   return { error: null, result: { retval } };
 }
 
+/** prepareTransaction's assemble step, with a fixed resource fee. */
+function assemblePrepared(tx) {
+  return StellarSdk.rpc
+    .assembleTransaction(tx, {
+      _parsed: true,
+      transactionData: new StellarSdk.SorobanDataBuilder().setResourceFee("4321"),
+      minResourceFee: "123",
+      result: {
+        auth: [],
+        retval: StellarSdk.nativeToScVal(undefined, { type: "void" }),
+      },
+    })
+    .build();
+}
+
+/** Successful create-contract result: the new contract hash in the first op. */
+function installResultXdr(contractHash = CONTRACT_HASH) {
+  const ok = StellarSdk.xdr.OperationResult.opInner(
+    StellarSdk.xdr.OperationResultTr.invokeHostFunction(
+      StellarSdk.xdr.InvokeHostFunctionResult.invokeHostFunctionSuccess(contractHash)
+    )
+  );
+  return new StellarSdk.xdr.TransactionResult({
+    feeCharged: StellarSdk.xdr.Int64.fromString("100"),
+    result: StellarSdk.xdr.TransactionResultResult.txSuccess([ok]),
+    ext: new StellarSdk.xdr.TransactionResultExt(0),
+  });
+}
+
+/** Stub the common prepare → sign → submit → poll pipeline for one invoke. */
+function stubSorobanSubmit(sendResult, successStatus = { status: "SUCCESS" }) {
+  sorobanServerMock.prepareTransaction.mockImplementation(async (tx) =>
+    assemblePrepared(tx)
+  );
+  signTransactionMock.mockImplementation(async (xdr) => ({
+    error: null,
+    signedTxXdr: xdr,
+  }));
+  sorobanServerMock.sendTransaction.mockResolvedValue(sendResult);
+  sorobanServerMock.getTransaction.mockResolvedValue(successStatus);
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
-  horizonServerMock.loadAccount.mockReset();
-  horizonServerMock.submitTransaction.mockReset();
+  getNetworkDetailsMock.mockResolvedValue({
+    network: "TESTNET",
+    networkPassphrase: StellarSdk.Networks.TESTNET,
+  });
 });
 
 afterEach(() => {
@@ -119,11 +191,18 @@ describe("readKitewellState", () => {
     sorobanServerMock.simulateTransaction.mockImplementation(async (tx) => {
       const method = tx.operations[0].func.value().functionName();
       if (method === "lab_name") return simOk(StellarSdk.nativeToScVal("Kitewell", { type: "string" }));
-      if (method === "builder_count") return simOk(StellarSdk.nativeToScVal(2, { type: "u32" }));
-      if (method === "get_builder")
+      if (method === "builder_count") return simOk(StellarSdk.nativeToScVal(2, { type: "u32" }));      if (method === "get_builder")
         return simOk(
           StellarSdk.xdr.ScVal.scvVec([
             StellarSdk.nativeToScVal("alice", { type: "string" }),
+          ])
+        );
+      if (method === "paused")
+        return simOk(StellarSdk.nativeToScVal(false, { type: "bool" }));
+      if (method === "get_admin")
+        return simOk(
+          StellarSdk.xdr.ScVal.scvVec([
+            StellarSdk.nativeToScVal(USER, { type: "address" }),
           ])
         );
       throw new Error(`unexpected method ${method}`);
@@ -135,9 +214,12 @@ describe("readKitewellState", () => {
       labName: "Kitewell",
       builderCount: 2,
       builder: "alice",
+      paused: false,
+      admin: USER,
     });
-    // Three parallel reads, each a single invokeHostFunction op.
-    expect(sorobanServerMock.simulateTransaction).toHaveBeenCalledTimes(3);
+
+    // Five parallel reads, each a single invokeHostFunction op.
+    expect(sorobanServerMock.simulateTransaction).toHaveBeenCalledTimes(5);
     const ops = sorobanServerMock.simulateTransaction.mock.calls.map(
       ([tx]) => tx.operations[0]
     );
@@ -145,6 +227,8 @@ describe("readKitewellState", () => {
       "lab_name",
       "builder_count",
       "get_builder",
+      "paused",
+      "get_admin",
     ]);
   });
 
@@ -153,12 +237,19 @@ describe("readKitewellState", () => {
       const method = tx.operations[0].func.value().functionName();
       if (method === "lab_name") return simOk(StellarSdk.nativeToScVal("Kitewell", { type: "string" }));
       if (method === "builder_count") return simOk(StellarSdk.nativeToScVal(0, { type: "u32" }));
+      if (method === "paused") return simOk(StellarSdk.nativeToScVal(false, { type: "bool" }));
       return simOk(StellarSdk.xdr.ScVal.scvVec([]));
     });
 
     const state = await readKitewellState(CONTRACT_ID, null);
 
-    expect(state).toEqual({ labName: "Kitewell", builderCount: 0, builder: null });
+    expect(state).toEqual({
+      labName: "Kitewell",
+      builderCount: 0,
+      builder: null,
+      paused: false,
+      admin: null,
+    });
   });
 
   it("falls back to the zero address when no viewer is passed", async () => {
@@ -168,6 +259,8 @@ describe("readKitewellState", () => {
         const caller = tx.operations[0].func.value().args()[0];
         return simOk(caller);
       }
+      if (method === "paused") return simOk(StellarSdk.nativeToScVal(false, { type: "bool" }));
+      if (method === "get_admin") return simOk(StellarSdk.xdr.ScVal.scvVec([]));
       return simOk(StellarSdk.nativeToScVal("Kitewell", { type: "string" }));
     });
 
@@ -419,37 +512,113 @@ describe("registerBuilderWithFreighter", () => {
   });
 });
 
-describe("clawbackClaimableBalanceWithFreighter", () => {
-  it("builds and submits a clawbackClaimableBalance operation", async () => {
-    horizonServerMock.loadAccount.mockResolvedValue(new StellarSdk.Account(USER, "7"));
-    horizonServerMock.submitTransaction.mockResolvedValue({ hash: "clawback-hash" });
+describe("pause and unregister through the generated client", () => {
+  /** Assemble without changing the call, so sendTransaction receives it. */
+  function prepareAsIs() {
+    sorobanServerMock.prepareTransaction.mockImplementation(async (tx) =>
+      StellarSdk.rpc
+        .assembleTransaction(tx, {
+          _parsed: true,
+          transactionData: new StellarSdk.SorobanDataBuilder(),
+          minResourceFee: "0",
+          result: { auth: [], retval: StellarSdk.nativeToScVal(undefined, { type: "void" }) },
+        })
+        .build()
+    );
+  }
+
+  function signAsIs() {
     signTransactionMock.mockImplementation(async (xdr) => ({
       error: null,
       signedTxXdr: xdr,
     }));
+  }
 
-    const result = await clawbackClaimableBalanceWithFreighter(USER, "a".repeat(64));
+  it("signs set_paused as the admin and reports the confirmation", async () => {
+    sorobanServerMock.getAccount.mockResolvedValue(rpcAccountFixture(USER));
+    prepareAsIs();
+    signAsIs();
+    sorobanServerMock.sendTransaction.mockResolvedValue({ status: "PENDING", hash: "pause123" });
+    sorobanServerMock.getTransaction.mockResolvedValue({ status: "SUCCESS" });
 
-    expect(result).toEqual({ hash: "clawback-hash" });
-    const [xdr] = signTransactionMock.mock.calls.at(-1);
+    const result = await setPausedWithFreighter(USER, CONTRACT_ID, true);
+
+    expect(result).toEqual({ hash: "pause123", returnValue: null, confirmed: true });
+
+    const [xdr, opts] = signTransactionMock.mock.calls[0];
+    expect(opts).toEqual({ networkPassphrase: StellarSdk.Networks.TESTNET, address: USER });
     const signed = StellarSdk.TransactionBuilder.fromXDR(xdr, StellarSdk.Networks.TESTNET);
-    expect(signed.operations[0].type).toBe("clawbackClaimableBalance");
-    expect(signed.operations[0].balanceId).toBe(`00000000${"a".repeat(64)}`);
+    const invoke = signed.operations[0].func.value();
+    expect(invoke.functionName().toString()).toBe("set_paused");
+    expect(StellarSdk.scValToNative(invoke.args()[0])).toBe(USER);
+    expect(StellarSdk.scValToNative(invoke.args()[1])).toBe(true);
   });
 
-  it("accepts a Horizon id that already includes the type prefix", async () => {
-    horizonServerMock.loadAccount.mockResolvedValue(new StellarSdk.Account(USER, "7"));
-    horizonServerMock.submitTransaction.mockResolvedValue({ hash: "clawback-hash" });
-    signTransactionMock.mockImplementation(async (xdr) => ({
-      error: null,
-      signedTxXdr: xdr,
-    }));
+  it("signs unregister for the connected builder", async () => {
+    sorobanServerMock.getAccount.mockResolvedValue(rpcAccountFixture(USER));
+    prepareAsIs();
+    signAsIs();
+    sorobanServerMock.sendTransaction.mockResolvedValue({ status: "PENDING", hash: "unreg123" });
+    sorobanServerMock.getTransaction.mockResolvedValue({ status: "SUCCESS" });
 
-    const horizonId = `00000000${"bb".repeat(32)}`;
-    await clawbackClaimableBalanceWithFreighter(USER, horizonId);
+    const result = await unregisterBuilderWithFreighter(USER, CONTRACT_ID);
 
-    const [xdr] = signTransactionMock.mock.calls.at(-1);
+    expect(result.confirmed).toBe(true);
+
+    const [xdr] = signTransactionMock.mock.calls[0];
     const signed = StellarSdk.TransactionBuilder.fromXDR(xdr, StellarSdk.Networks.TESTNET);
-    expect(signed.operations[0].balanceId).toBe(horizonId);
+    const invoke = signed.operations[0].func.value();
+    expect(invoke.functionName().toString()).toBe("unregister");
+    expect(StellarSdk.scValToNative(invoke.args()[0])).toBe(USER);
+  });
+
+  it("turns a NotAdmin contract error into plain language without submitting", async () => {
+    sorobanServerMock.getAccount.mockResolvedValue(rpcAccountFixture(USER));
+    sorobanServerMock.prepareTransaction.mockRejectedValue(
+      new Error("HostError: Error(Contract, #3)")
+    );
+
+    await expect(setPausedWithFreighter(USER, CONTRACT_ID, true)).rejects.toThrow(
+      "Only the lab admin can do that. The transaction was not submitted."
+    );
+    expect(signTransactionMock).not.toHaveBeenCalled();
+    expect(sorobanServerMock.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("turns a Paused contract error into plain language while registering", async () => {
+    sorobanServerMock.getAccount.mockResolvedValue(rpcAccountFixture(USER));
+    sorobanServerMock.prepareTransaction.mockRejectedValue(
+      new Error("HostError: Error(Contract, #4)")
+    );
+
+    await expect(
+      registerBuilderWithFreighter(USER, CONTRACT_ID, "alice")
+    ).rejects.toThrow("Registration is paused by the lab admin. Unpause it to register.");
+    expect(sorobanServerMock.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("turns a NotRegistered contract error into plain language", async () => {
+    sorobanServerMock.getAccount.mockResolvedValue(rpcAccountFixture(USER));
+    sorobanServerMock.prepareTransaction.mockRejectedValue(
+      new Error("HostError: Error(Contract, #6)")
+    );
+
+    await expect(unregisterBuilderWithFreighter(USER, CONTRACT_ID)).rejects.toThrow(
+      "This builder is not registered, so there is nothing to remove."
+    );
+    expect(sorobanServerMock.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("refuses to submit when Freighter is on a different network than the contract", async () => {
+    getNetworkDetailsMock.mockResolvedValue({
+      network: "FUTURENET",
+      networkPassphrase: StellarSdk.Networks.FUTURENET,
+    });
+
+    await expect(setPausedWithFreighter(USER, CONTRACT_ID, true)).rejects.toThrow(
+      "Freighter is on FUTURENET, but this contract is on a different network."
+    );
+    expect(sorobanServerMock.getAccount).not.toHaveBeenCalled();
+    expect(signTransactionMock).not.toHaveBeenCalled();
   });
 });

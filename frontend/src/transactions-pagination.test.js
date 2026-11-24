@@ -68,6 +68,23 @@ describe("getTransactions pagination", () => {
     expect(fetchPaymentsViaApi.mock.calls[0][2]).toBe("token-1");
   });
 
+  it("passes the abort signal through to the backend request", async () => {
+    const controller = new AbortController();
+    fetchPaymentsViaApi.mockResolvedValue({ records: [], nextCursor: null });
+
+    await getTransactions("GTEST", 15, undefined, {
+      signal: controller.signal,
+    });
+
+    expect(fetchPaymentsViaApi).toHaveBeenCalledWith(
+      "GTEST",
+      15,
+      undefined,
+      undefined,
+      { signal: controller.signal }
+    );
+  });
+
   it("pages a fixture forward and back without repeating rows", async () => {
     const firstPage = {
       records: [{ id: "p3" }, { id: "p2" }],

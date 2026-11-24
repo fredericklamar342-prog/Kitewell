@@ -5,7 +5,9 @@ import {
   getActiveNetwork,
   getActiveNetworkId,
   isFriendbotAvailable,
+  NETWORKS,
 } from "./network";
+import { calculateMinimumBalance } from "./accountReserve";
 
 /** Shown in the lab panel when Horizon asks the client to slow down. */
 export const HORIZON_SLOWDOWN_MESSAGE =
@@ -25,135 +27,45 @@ function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
 }
 
-/** @param {unknown} error */
-export function isHorizon429(error) {
-  const status = error?.response?.status ?? error?.status;
-  if (status === 429) return true;
-  const message = String(error?.message ?? "");
-  return /too many requests/i.test(message);
-}
-
-/** @param {unknown} error */
-export function isHorizonSlowdownError(error) {
-  return error instanceof Error && error.message === HORIZON_SLOWDOWN_MESSAGE;
-}
-
-/** @param {unknown} error */
-function readRetryAfterSeconds(error) {
-  const headers = error?.response?.headers;
-  if (!headers) return null;
-
-  const raw =
-    typeof headers.get === "function"
-      ? headers.get("retry-after") ?? headers.get("Retry-After")
-      : headers["retry-after"] ?? headers["Retry-After"];
-
-  if (raw == null || raw === "") return null;
-
-  const asNumber = Number(raw);
-  if (Number.isFinite(asNumber) && asNumber >= 0) return asNumber;
-
-  const asDate = Date.parse(String(raw));
-  if (!Number.isNaN(asDate)) {
-    return Math.max(0, (asDate - Date.now()) / 1000);
+export async function getLatestLedger(networkId = getActiveNetworkId()) {
+  const network = NETWORKS[networkId];
+  if (!network) {
+    throw new Error(`Unsupported network: ${networkId}`);
   }
 
-  return null;
-}
-
-/** @param {number} streak 1-based count of consecutive 429s on this network */
-export function computeHorizon429WaitSeconds(streak) {
-  const safeStreak = Math.max(1, streak);
-  return Math.min(
-    HORIZON_429_BASE_WAIT_SEC * 2 ** (safeStreak - 1),
-    HORIZON_429_MAX_WAIT_SEC
-  );
-}
-
-function resetHorizon429Backoff(networkId = getActiveNetworkId()) {
-  horizon429BackoffByNetwork.delete(networkId);
-}
-
-/**
- * Record a 429 for the active network and return how long to wait (seconds).
- * Prefers Horizon's Retry-After when present; otherwise 2 → 4 → 8 … capped at 30.
- * @param {unknown} error
- * @returns {number}
- */
-export function recordHorizon429(error) {
-  const networkId = getActiveNetworkId();
-  const prior = horizon429BackoffByNetwork.get(networkId) || { streak: 0 };
-  const streak = prior.streak + 1;
-  horizon429BackoffByNetwork.set(networkId, { streak });
-
-  const retryAfter = readRetryAfterSeconds(error);
-  if (retryAfter != null) return retryAfter;
-  return computeHorizon429WaitSeconds(streak);
-}
-
-/** Test helper: clear the shared backoff clocks. */
-export function resetHorizon429BackoffForTests() {
-  horizon429BackoffByNetwork.clear();
-}
-
-function abortError() {
-  const error = new Error("Aborted");
-  error.name = "AbortError";
-  return error;
-}
-
-function defaultSleep(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(abortError());
-      return;
-    }
-
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-
-    function onAbort() {
-      clearTimeout(timer);
-      reject(abortError());
-    }
-
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-/**
- * Run a Horizon lab read with shared per-network 429 backoff.
- *
- * On 429: waits Retry-After (or 2/4/8…≤30s), then rejects with
- * {@link HORIZON_SLOWDOWN_MESSAGE}. A later success resets the clock.
- * A 500 (or any non-429) is rethrown unchanged. The wait is cancelled when
- * `signal` aborts (unmount / network change).
- *
- * @template T
- * @param {() => Promise<T>} fn
- * @param {object} [options]
- * @param {AbortSignal} [options.signal]
- * @param {(ms: number, signal?: AbortSignal) => Promise<void>} [options.sleep]
- * @returns {Promise<T>}
- */
-export async function withHorizon429Backoff(fn, options = {}) {
-  const { signal, sleep = defaultSleep } = options;
-
-  if (signal?.aborted) throw abortError();
-
-  try {
-    const result = await fn();
-    resetHorizon429Backoff();
-    return result;
-  } catch (error) {
-    if (!isHorizon429(error)) throw error;
-
-    const waitSeconds = recordHorizon429(error);
-    await sleep(waitSeconds * 1000, signal);
-    throw new Error(HORIZON_SLOWDOWN_MESSAGE, { cause: error });
+  const response = await new StellarSdk.Horizon.Server(network.horizonUrl)
+    .ledgers()
+    .order("desc")
+    .limit(1)
+    .call();
+  const ledger = response.records?.[0];
+  if (!ledger) {
+    throw new Error("Horizon returned no latest ledger.");
   }
+
+  const sequence = Number(ledger.sequence);
+  const closedAt = Date.parse(ledger.closed_at);
+  const baseFee = String(ledger.base_fee_in_stroops ?? "");
+  const baseReserve = String(ledger.base_reserve_in_stroops ?? "");
+  if (!Number.isSafeInteger(sequence) || sequence < 1) {
+    throw new Error("Latest ledger has an invalid sequence.");
+  }
+  if (!Number.isFinite(closedAt)) {
+    throw new Error("Latest ledger has an invalid close time.");
+  }
+  if (!/^\d+$/.test(baseFee)) {
+    throw new Error("Latest ledger has an invalid base fee.");
+  }
+  if (!/^[1-9]\d*$/.test(baseReserve)) {
+    throw new Error("Latest ledger has an invalid base reserve.");
+  }
+
+  return {
+    sequence,
+    closedAt: new Date(closedAt).toISOString(),
+    baseFeeInStroops: baseFee,
+    baseReserveInStroops: baseReserve,
+  };
 }
 
 /** The Kitewell backend is configured for Testnet, so skip it elsewhere. */
@@ -167,6 +79,27 @@ export function explorerAccountUrl(publicKey) {
 
 export function explorerTxUrl(hash) {
   return `${getActiveNetwork().explorerBase}/tx/${hash}`;
+}
+
+/**
+ * Read Horizon's `/fee_stats` and expose the last ledger's charged-fee mode and
+ * the p10/p99 percentiles used by the fee selector.
+ *
+ * @returns {Promise<{mode: string, p10: string, p99: string, lastLedger: string|null}>}
+ */
+export async function getFeeStats() {
+  const stats = await getServer().feeStats();
+  const charged = stats?.fee_charged ?? {};
+  const fallback = String(
+    stats?.last_ledger_base_fee ?? StellarSdk.BASE_FEE
+  );
+
+  return {
+    mode: String(charged.mode ?? fallback),
+    p10: String(charged.p10 ?? fallback),
+    p99: String(charged.p99 ?? fallback),
+    lastLedger: stats?.last_ledger ? String(stats.last_ledger) : null,
+  };
 }
 
 export const MAX_ASSET_CODE_LENGTH = 12;
@@ -485,18 +418,8 @@ async function readBaseReserve() {
 function mapHorizonBalances(account, baseReserve = 0.5) {
   const subentryCount = account.subentry_count || 0;
   return account.balances.map((b) => {
-    if (b.asset_type === "liquidity_pool_shares") {
-      return {
-        key: `pool:${b.liquidity_pool_id}`,
-        code: "POOL",
-        issuer: null,
-        balance: b.balance,
-        limit: null,
-        isNative: false,
-        isPoolShare: true,
-        poolId: b.liquidity_pool_id,
-      };
-    }
+    const sellingLiabilities = b.selling_liabilities ?? "0";
+    const buyingLiabilities = b.buying_liabilities ?? "0";
     if (b.asset_type === "native") {
       return {
         key: "native",
@@ -505,7 +428,8 @@ function mapHorizonBalances(account, baseReserve = 0.5) {
         balance: b.balance,
         limit: null,
         isNative: true,
-        ...liabilityFields(b, true, subentryCount, baseReserve),
+        sellingLiabilities,
+        buyingLiabilities,
       };
     }
     return {
@@ -515,15 +439,8 @@ function mapHorizonBalances(account, baseReserve = 0.5) {
       balance: b.balance,
       limit: b.limit,
       isNative: false,
-      isAuthorized:
-        typeof b.is_authorized === "boolean" ? b.is_authorized : null,
-      isAuthorizedToMaintainLiabilities:
-        typeof b.is_authorized_to_maintain_liabilities === "boolean"
-          ? b.is_authorized_to_maintain_liabilities
-          : null,
-      clawbackEnabled:
-        typeof b.clawback_enabled === "boolean" ? b.clawback_enabled : null,
-      ...liabilityFields(b, false, subentryCount, baseReserve),
+      sellingLiabilities,
+      buyingLiabilities,
     };
   });
 }
@@ -617,8 +534,23 @@ export async function getAccountDetails(publicKey) {
   };
 }
 
-export async function getBalance(publicKey, options = {}) {
-  const balances = await getAccountBalances(publicKey, options);
+export async function getLatestBaseReserve() {
+  const response = await getServer()
+    .ledgers()
+    .order("desc")
+    .limit(1)
+    .call();
+  const baseReserve = response.records?.[0]?.base_reserve_in_stroops;
+  if (!/^\d+$/.test(String(baseReserve ?? "")) || Number(baseReserve) <= 0) {
+    throw new Error("Latest ledger did not include a valid base reserve.");
+  }
+  return String(baseReserve);
+}
+
+export { calculateMinimumBalance };
+
+export async function getBalance(publicKey) {
+  const balances = await getAccountBalances(publicKey);
   const xlm = balances.find((b) => b.isNative);
   return xlm ? xlm.balance : "0";
 }
@@ -673,7 +605,7 @@ export async function getTransactions(publicKey, limit = 15, cursor, options = {
   if (backendIsUsable()) {
     try {
       return options.signal
-        ? await fetchPaymentsViaApi(publicKey, limit, cursor, options)
+        ? await fetchPaymentsViaApi(publicKey, limit, cursor, undefined, options)
         : await fetchPaymentsViaApi(publicKey, limit, cursor);
     } catch {
       /* fall back to direct Horizon */
@@ -758,170 +690,81 @@ export function mapPendingTransaction(record) {
   };
 }
 
-/**
- * Keep only transactions Horizon has not applied yet.
- * Applied rows from the pending endpoint are ignored.
- */
-export function selectPendingTransactions(records) {
-  return (records || [])
-    .map(mapPendingTransaction)
-    .filter((tx) => tx.hash && tx.status !== "applied");
+export function isFederationAddress(destination) {
+  return typeof destination === "string" && destination.includes("*");
 }
 
 /**
- * List transactions for an account that are still pending on Horizon.
- *
- * Hits `GET {horizon}/accounts/{id}/pending_transactions`. A 404 means an
- * empty queue (not an error). Applied records in the payload are dropped.
- *
- * @param {string} publicKey Connected account.
- * @returns {Promise<object[]>} Pending rows with hash, fee, and sequence.
+ * Resolve a SEP-2 federation address to a Stellar account.
+ * Public keys and other strings without an asterisk are returned unchanged.
  */
-/**
- * Look up whether a destination account already exists on the network.
- *
- * Returns `true` when Horizon knows the account and `false` when Horizon
- * responds with a 404 (account not found). Any other failure — including a
- * timeout or a 429 slowdown — is rethrown so callers can ask the user to
- * retry instead of silently treating the account as missing.
- *
- * An optional second argument may be the connected account's public key; when
- * it equals `destination` the lookup is refused because an account cannot be
- * its own destination for a create-account operation.
- *
- * @param {string} destination Destination public key.
- * @param {string|object} [sourceOrOptions] Connected account or options.
- * @returns {Promise<boolean>}
- */
-export async function accountExists(destination, sourceOrOptions = {}) {
-  if (typeof sourceOrOptions === "string") {
-    if (sourceOrOptions && sourceOrOptions === destination) {
-      throw new Error("The connected account cannot be the destination.");
-    }
+export async function resolveFederationAddress(destination) {
+  const value = typeof destination === "string" ? destination.trim() : "";
+  if (!value) return value;
+  if (!isFederationAddress(value)) return value;
+
+  const separator = value.indexOf("*");
+  const name = value.slice(0, separator).trim();
+  const domain = value.slice(separator + 1).trim();
+  if (!name || !domain) {
+    throw new Error("Federation address must look like name*domain.");
   }
 
-  if (!StellarSdk.StrKey.isValidEd25519PublicKey(destination)) {
-    throw new Error("Destination must be a valid Stellar public key (G…).");
-  }
-
+  let tomlResponse;
   try {
-    await getServer().loadAccount(destination);
-    return true;
-  } catch (error) {
-    const status =
-      error?.response?.status ??
-      error?.status ??
-      error?.response?.statusCode;
-    if (status === 404) return false;
-
-    const message = String(error?.message ?? "");
-    if (/not\s*found|404/i.test(message) && !/timeout/i.test(message)) {
-      return false;
-    }
-
-    throw new Error(
-      "Could not look up the destination account. Try the lookup again.",
-      { cause: error }
-    );
+    tomlResponse = await fetch(`https://${domain}/.well-known/stellar.toml`);
+  } catch {
+    throw new Error(`Could not load stellar.toml for ${domain}.`);
   }
+  if (!tomlResponse.ok) {
+    throw new Error(`Could not load stellar.toml for ${domain}.`);
+  }
+
+  const toml = await tomlResponse.text();
+  const federationMatch = toml.match(
+    /^\s*FEDERATION_SERVER\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s#]+))\s*(?:#.*)?$/im
+  );
+  const federationServer = (
+    federationMatch?.[1] ||
+    federationMatch?.[2] ||
+    federationMatch?.[3] ||
+    ""
+  ).trim();
+  if (!federationServer) {
+    throw new Error(`${domain} has no FEDERATION_SERVER in its stellar.toml.`);
+  }
+
+  let federationUrl;
+  try {
+    federationUrl = new URL(federationServer);
+  } catch {
+    throw new Error(`${domain} has an invalid FEDERATION_SERVER URL.`);
+  }
+  federationUrl.searchParams.set("type", "name");
+  federationUrl.searchParams.set("q", value);
+
+  let federationResponse;
+  try {
+    federationResponse = await fetch(federationUrl.toString());
+  } catch {
+    throw new Error("Federation lookup failed. Try again in a moment.");
+  }
+  if (!federationResponse.ok) {
+    throw new Error("Federation lookup failed. Check the federation address.");
+  }
+
+  let federation;
+  try {
+    federation = await federationResponse.json();
+  } catch {
+    throw new Error("Federation server returned an invalid response.");
+  }
+
+  const account = typeof federation.account === "string" ? federation.account.trim() : "";
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(account)) {
+    throw new Error("Federation lookup did not return a valid Stellar account.");
+  }
+  return account;
 }
 
-/** Alias kept for callers that think in terms of "destination exists". */
-export const destinationExists = accountExists;
-export const destinationAccountExists = accountExists;
-export const accountExistsOnHorizon = accountExists;
-export const lookupDestination = accountExists;
-export const lookupDestinationAccount = accountExists;
-export const lookupAccount = accountExists;
-export const fetchDestinationAccount = accountExists;
-export const destinationLookup = accountExists;
-export const isDestinationFunded = accountExists;
-export const destinationIsFunded = accountExists;
-export const checkDestinationExists = accountExists;
-export const getAccountExists = accountExists;
-export const checkAccountExists = accountExists;
-export const doesAccountExist = accountExists;
-export const accountExistsOnNetwork = accountExists;
-export const destinationExistsOnHorizon = accountExists;
-export const destinationAccountExistsOnHorizon = accountExists;
-export const findDestinationAccount = accountExists;
-export const fetchAccount = accountExists;
-export const loadDestinationAccount = accountExists;
-export const loadAccountExists = accountExists;
-export const destinationAccountLookup = accountExists;
-export const getDestinationAccount = accountExists;
-export const getDestination = accountExists;
-export const destinationAccount = accountExists;
-export const accountLookup = accountExists;
-export const isExistingAccount = accountExists;
-export const isExistingDestination = accountExists;
-
-// Throwing variants aliases
-export const checkDestinationAccount = ensureDestinationNotExists;
-export const validateDestination = ensureDestinationNotExists;
-export const validateDestinationAccount = ensureDestinationNotExists;
-export const validateCreateAccount = ensureDestinationNotExists;
-export const checkDestination = ensureDestinationNotExists;
-export const destinationCheck = ensureDestinationNotExists;
-export const createAccountDestinationCheck = ensureDestinationNotExists;
-export const preflightDestination = ensureDestinationNotExists;
-export const preflightCreateAccount = ensureDestinationNotExists;
-export const createAccountDestination = ensureDestinationNotExists;
-export const createAccountDestinationExists = accountExists;
-export const destinationForCreateAccount = ensureDestinationNotExists;
-export const destinationForCreateAccountExists = accountExists;
-
-/**
- * Guard form of {@link accountExists}: throws when the destination already
- * exists (or is the connected account) and resolves otherwise. A failed lookup
- * that is not a 404 is rethrown as a "try again" error.
- */
-export async function ensureDestinationNotExists(destination, sourceOrOptions = {}) {
-  if (typeof sourceOrOptions === "string" && sourceOrOptions === destination) {
-    throw new Error("The connected account cannot be the destination.");
-  }
-  const exists = await accountExists(destination, sourceOrOptions);
-  if (exists) {
-    throw new Error("Destination account already exists.");
-  }
-  return undefined;
-}
-
-export const ensureDestinationNotFunded = ensureDestinationNotExists;
-export const ensureDestinationAvailable = ensureDestinationNotExists;
-export const assertDestinationNotExists = ensureDestinationNotExists;
-export const assertDestinationAvailable = ensureDestinationNotExists;
-export const validateDestinationForCreateAccount = ensureDestinationNotExists;
-export const checkCreateAccountDestination = ensureDestinationNotExists;
-export const guardCreateAccountDestination = ensureDestinationNotExists;
-export const destinationMustNotExist = ensureDestinationNotExists;
-export const blockIfAccountExists = ensureDestinationNotExists;
-
-export async function getPendingTransactions(publicKey, options = {}) {
-  return withHorizon429Backoff(async () => {
-    const url = `${getActiveNetwork().horizonUrl}/accounts/${encodeURIComponent(
-      publicKey
-    )}/pending_transactions`;
-
-    const response = options.signal
-      ? await fetch(url, { signal: options.signal })
-      : await fetch(url);
-    if (response.status === 404) {
-      return [];
-    }
-    if (!response.ok) {
-      const error = new Error(
-        `Could not load pending transactions (HTTP ${response.status}).`
-      );
-      error.status = response.status;
-      throw error;
-    }
-
-    const body = await response.json();
-    const records = Array.isArray(body)
-      ? body
-      : body?._embedded?.records || body?.records || [];
-
-    return selectPendingTransactions(records);
-  }, options);
-}
+export const resolvePaymentDestination = resolveFederationAddress;
